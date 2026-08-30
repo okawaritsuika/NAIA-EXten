@@ -1,0 +1,8 @@
+{
+  "id": "naia_exten",
+  "name": "NAIA 추가 편의기능",
+  "version": "0.4.0",
+  "naia_ext_api": 1,
+  "entry": "main.py",
+  "description": "NAIA 2.0 종합 Extension — PromptServer Comic Maker/랜덤 상황 결합 + Search Parquet 실시간 동기화/다중 랜덤 풀 + Character 동일 와일드카드 공유 + Tag Filter GSQE 확률 분배 + feature hot reload"
+}

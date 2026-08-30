@@ -1,0 +1,360 @@
+from __future__ import annotations
+
+import copy
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+from PIL import Image
+
+from naia_exten.features.comic_maker.feature import ComicMakerFeature
+from naia_exten.features.comic_maker.models import validate_comic_plan
+from naia_exten.features.comic_maker.renderer import compose_page, font_pixels, panel_generation_size
+
+
+def comic_plan():
+    return {
+        "schema_version": 1,
+        "id": 7,
+        "title": "선술집의 밤",
+        "preset_id": "comic_default",
+        "width": 704,
+        "height": 1280,
+        "page_count": 1,
+        "male_count": 1,
+        "female_count": 1,
+        "locale": "ko",
+        "text_mode": "overlay",
+        "global_prompt": "comic, sequential art",
+        "character_prompts": {
+            "male1": "adult man, black hair",
+            "female1": "adult woman, auburn hair",
+        },
+        "pages": [
+            {
+                "page_number": 1,
+                "location": "old tavern, indoors, night",
+                "base_prompt": "dim lantern light",
+                "negative_prompt": "lowres",
+                "panels": [
+                    {
+                        "id": "p1",
+                        "order": 1,
+                        "rect": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 0.5},
+                        "location": "at a wooden table",
+                        "shot": "wide shot",
+                        "action": "the characters sit together",
+                        "prompt": "bottles on table",
+                        "character_ids": ["male1", "female1"],
+                    },
+                    {
+                        "id": "p2",
+                        "order": 2,
+                        "rect": {"x": 0.0, "y": 0.5, "w": 1.0, "h": 0.5},
+                        "location": "near the tavern door",
+                        "shot": "close-up",
+                        "action": "the woman looks surprised",
+                        "prompt": "dramatic lighting",
+                        "character_ids": ["female1"],
+                    },
+                ],
+                "bubbles": [
+                    {
+                        "id": "b1",
+                        "panel_id": "p1",
+                        "speaker": "female1",
+                        "text": "이 술은 너무 독해요.",
+                        "rect": {"x": 0.08, "y": 0.07, "w": 0.30, "h": 0.10},
+                        "tail": {"x": 0.38, "y": 0.19},
+                        "style": "round",
+                        "font_scale": 0.035,
+                        "rotation": 0,
+                    }
+                ],
+                "sound_effects": [
+                    {
+                        "id": "s1",
+                        "panel_id": "p2",
+                        "text": "쾅!",
+                        "anchor": {"x": 0.80, "y": 0.70},
+                        "max_width": 0.22,
+                        "font_scale": 0.07,
+                        "rotation": -12,
+                        "style": "jagged",
+                        "color": "#d94b64",
+                    }
+                ],
+            }
+        ],
+    }
+
+
+class _FakeClient:
+    def __init__(self, plan):
+        self.plan = copy.deepcopy(plan)
+        self.queries = []
+        self.used = []
+
+    def presets(self):
+        return [{"id": "comic_default"}]
+
+    def random_plan(self, **query):
+        self.queries.append(query)
+        return copy.deepcopy(self.plan)
+
+    def mark_used(self, comic_id):
+        self.used.append(comic_id)
+
+
+class _FakeContext:
+    def __init__(self, root: Path):
+        self.ext_dir = root
+        self.root = root
+        self.settings = {
+            "feature__comic_maker__enabled": True,
+            "feature__comic_maker__preset": "comic_default",
+            "feature__comic_maker__width": 832,
+            "feature__comic_maker__height": 1216,
+            "feature__comic_maker__page_count": 1,
+            "feature__comic_maker__male_count": 1,
+            "feature__comic_maker__female_count": 1,
+            "feature__comic_maker__locale": "ko",
+            "feature__comic_maker__text_mode": "overlay",
+            "feature__comic_maker__include_used": False,
+        }
+        self.enqueued = []
+        self.cancelled = []
+        self.results = {}
+        self.toasts = []
+        self.logs = []
+        self.queue_starts = 0
+        self.confirmations = []
+        self.current_params = {
+            "pre_prompt": "masterpiece, clean lineart",
+            "post_prompt": "high detail",
+            "negative_prompt": "bad anatomy",
+            "steps": 41,
+            "cfg_scale": 7.2,
+            "sampler": "k_euler_ancestral",
+            "scheduler": "karras",
+        }
+        self.character_snapshot = {
+            "characters": ["1boy, short black hair", "1girl, long auburn hair"],
+            "uc": ["", ""],
+            "character_positions": [{"x": 0.3, "y": 0.5}, {"x": 0.7, "y": 0.5}],
+        }
+
+    def subscribe(self, *_args, **_kwargs):
+        return None
+
+    def load_settings(self, defaults):
+        return {**defaults, **self.settings}
+
+    def get_current_request(self):
+        return {"ok": True, "api_mode": "NAI", "prompt_run_id": "",
+                "params": copy.deepcopy(self.current_params)}
+
+    def resolve_nai_characters(self):
+        return copy.deepcopy(self.character_snapshot)
+
+    def request_confirmation(self, message, **kwargs):
+        self.confirmations.append((message, kwargs))
+        return True
+
+    def enqueue_generation(self, **kwargs):
+        request_id = f"req-{len(self.enqueued) + 1}"
+        self.enqueued.append((request_id, kwargs))
+        return {"ok": True, "request_id": request_id, "message": ""}
+
+    def cancel_generation(self, request_id):
+        self.cancelled.append(request_id)
+        return {"ok": True, "skip_scheduled": False, "message": ""}
+
+    def start_generation_queue(self):
+        self.queue_starts += 1
+        return {"ok": True, "message": ""}
+
+    def get_result_image(self, request_id):
+        image = self.results.get(request_id)
+        if image is None:
+            return {"ok": False, "message": "missing"}
+        return {"ok": True, "image": image.copy(), "file_path": "", "message": ""}
+
+    def get_save_directory(self):
+        return str(self.root)
+
+    def show_toast(self, message, level="info"):
+        self.toasts.append((message, level))
+
+    def log(self, message):
+        self.logs.append(message)
+
+
+class ComicMakerTests(unittest.TestCase):
+    def test_panel_exposes_make_action_without_feature_activation(self):
+        feature = ComicMakerFeature()
+        fields = feature.panel_fields()
+        make = next(field for field in fields if field["key"] == "make")
+        self.assertNotIn("visible_when", make)
+        self.assertFalse(feature.panel_toggle_visible)
+
+    def test_validates_coordinates_and_references(self):
+        plan = validate_comic_plan(comic_plan())
+        self.assertEqual(plan["pages"][0]["panels"][0]["id"], "p1")
+
+        broken = comic_plan()
+        broken["pages"][0]["bubbles"][0]["panel_id"] = "missing"
+        with self.assertRaisesRegex(ValueError, "존재하지 않는 panel_id"):
+            validate_comic_plan(broken)
+
+        broken = comic_plan()
+        broken["pages"][0]["panels"][0]["rect"]["w"] = 1.1
+        with self.assertRaisesRegex(ValueError, "페이지 경계"):
+            validate_comic_plan(broken)
+
+        broken = comic_plan()
+        broken["width"] = 704.5
+        with self.assertRaisesRegex(ValueError, "정수"):
+            validate_comic_plan(broken)
+
+        oversized = comic_plan()
+        oversized["pages"][0]["sound_effects"][0]["font_scale"] = 1.1
+        self.assertEqual(
+            validate_comic_plan(oversized)["pages"][0]["sound_effects"][0]["font_scale"],
+            1.1,
+        )
+
+    def test_font_scale_accepts_multiplier_and_preserves_legacy_normalized_values(self):
+        self.assertEqual(font_pixels(1.0, 704, base_ratio=0.035), 25)
+        self.assertEqual(font_pixels(1.1, 704, base_ratio=0.07), 54)
+        self.assertEqual(font_pixels(0.035, 704, base_ratio=0.035), 25)
+
+    def test_gender_detection_is_strict_per_active_slot(self):
+        self.assertEqual(ComicMakerFeature._gender("1girl, red hair"), "female")
+        self.assertEqual(ComicMakerFeature._gender("1boy, black hair"), "male")
+        with self.assertRaises(ValueError):
+            ComicMakerFeature._gender("red hair")
+        with self.assertRaises(ValueError):
+            ComicMakerFeature._gender("2girls")
+
+    def test_explicit_spatial_prompts_repeat_fixed_identity_at_server_centers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = _FakeContext(Path(temp_dir))
+            plan = comic_plan()
+            plan["pages"][0]["spatial_prompts"] = [{
+                "character_id": "female1",
+                "prompt": "surprised, looking left",
+                "centers": [{"x": 0.2, "y": 0.3}, {"x": 0.8, "y": 0.7}],
+            }]
+            plan["pages"][0]["bubbles"] = []
+            plan["pages"][0]["sound_effects"] = []
+            feature = ComicMakerFeature()
+            feature._attach(SimpleNamespace(ctx=ctx, refresh_panel=lambda: None))
+            feature._client = _FakeClient(plan)
+
+            feature._prepare()
+            feature._start_pending()
+
+            overrides = ctx.enqueued[0][1]["overrides"]
+            self.assertEqual(overrides["character_positions"], [
+                {"x": 0.2, "y": 0.3}, {"x": 0.8, "y": 0.7}
+            ])
+            self.assertEqual(len(overrides["characters"]), 2)
+            self.assertTrue(all("1girl, long auburn hair" in value for value in overrides["characters"]))
+
+    def test_panel_size_and_page_composition_keep_target_resolution(self):
+        plan = validate_comic_plan(comic_plan())
+        page = plan["pages"][0]
+        self.assertEqual(panel_generation_size(page["panels"][0]["rect"], 704, 1280), (704, 640))
+        panel_images = {
+            "p1": Image.new("RGB", (704, 640), "red"),
+            "p2": Image.new("RGB", (704, 640), "blue"),
+        }
+        image = compose_page(704, 1280, page, panel_images, text_mode="overlay")
+        self.assertEqual(image.size, (704, 1280))
+        self.assertNotEqual(image.getpixel((100, 100)), image.getpixel((100, 1000)))
+
+    def test_run_fetches_by_cast_only_and_generates_one_full_image_per_page(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = _FakeContext(Path(temp_dir))
+            client = _FakeClient(comic_plan())
+            feature = ComicMakerFeature()
+            feature._attach(SimpleNamespace(ctx=ctx, refresh_panel=lambda: None))
+            feature._client = client
+
+            feature._prepare()
+            self.assertEqual(set(client.queries[0]), {"male_count", "female_count", "mark_used"})
+            self.assertEqual((client.queries[0]["male_count"], client.queries[0]["female_count"]), (1, 1))
+            self.assertEqual(len(ctx.confirmations), 1)
+            self.assertIn("1페이지", ctx.confirmations[0][0])
+            self.assertIn("832 × 1216", ctx.confirmations[0][0])
+
+            feature._start_pending()
+            self.assertEqual(len(ctx.enqueued), 1)
+            self.assertEqual(ctx.queue_starts, 1)
+            self.assertFalse(client.queries[0]["mark_used"])
+            first_overrides = ctx.enqueued[0][1]["overrides"]
+            self.assertEqual((first_overrides["width"], first_overrides["height"]), (832, 1216))
+            self.assertEqual(first_overrides["steps"], 41)
+            self.assertEqual(first_overrides["cfg_scale"], 7.2)
+            self.assertEqual(first_overrides["sampler"], "k_euler_ancestral")
+            self.assertIn("masterpiece, clean lineart", ctx.enqueued[0][1]["prompt"])
+            self.assertTrue(ctx.enqueued[0][1]["prompt"].endswith("high detail"))
+            self.assertIn("bad anatomy", ctx.enqueued[0][1]["negative_prompt"])
+            self.assertEqual(len(first_overrides["characters"]), 4)
+            self.assertIn("1boy, short black hair", first_overrides["characters"][0])
+            self.assertIn("1girl, long auburn hair", first_overrides["characters"][1])
+            self.assertIn("speech bubble next to girl,text: 이 술은 너무 독해요.",
+                          first_overrides["characters"][1])
+            self.assertIn("1girl, long auburn hair", first_overrides["characters"][2])
+            self.assertEqual(first_overrides["characters"][3], "sound effects,text: 쾅!")
+            self.assertNotIn("dialogue letters", ctx.enqueued[0][1]["negative_prompt"])
+            self.assertNotIn("이 술은 너무 독해요.", ctx.enqueued[0][1]["prompt"])
+
+            ctx.results["req-1"] = Image.new("RGB", (704, 1280), "red")
+            feature.on_generation_result({"request_id": "req-1"})
+
+            self.assertEqual(client.used, [7])
+            pages = list(Path(temp_dir).glob("comic_maker/*/page_001.png"))
+            self.assertEqual(len(pages), 1)
+            with Image.open(pages[0]) as saved:
+                self.assertEqual(saved.size, (832, 1216))
+
+    def test_multiple_pages_reuse_the_same_fixed_character_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = _FakeContext(Path(temp_dir))
+            multi = comic_plan()
+            multi["page_count"] = 2
+            page2 = copy.deepcopy(multi["pages"][0])
+            page2["page_number"] = 2
+            multi["pages"].append(page2)
+            feature = ComicMakerFeature()
+            feature._attach(SimpleNamespace(ctx=ctx, refresh_panel=lambda: None))
+            feature._client = _FakeClient(multi)
+
+            feature._prepare()
+            feature._start_pending()
+
+            self.assertEqual(len(ctx.enqueued), 2)
+            first = ctx.enqueued[0][1]["overrides"]["characters"]
+            second = ctx.enqueued[1][1]["overrides"]["characters"]
+            self.assertEqual(first, second)
+
+    def test_failed_panel_does_not_mark_plan_used(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = _FakeContext(Path(temp_dir))
+            client = _FakeClient(comic_plan())
+            feature = ComicMakerFeature()
+            feature._attach(SimpleNamespace(ctx=ctx, refresh_panel=lambda: None))
+            feature._client = client
+            feature._prepare()
+            feature._start_pending()
+
+            feature.on_generation_result({"request_id": "req-1"})
+            self.assertEqual(client.used, [])
+            self.assertTrue(any("used 처리 안 함" in message for message, _ in ctx.toasts))
+
+
+if __name__ == "__main__":
+    unittest.main()

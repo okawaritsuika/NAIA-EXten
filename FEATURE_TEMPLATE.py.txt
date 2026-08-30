@@ -1,0 +1,44 @@
+# Copy this file to:
+#   naia_exten/features/<feature_name>.py
+
+from naia_exten.features.base_feature import BaseFeature
+
+
+class MyFeature(BaseFeature):
+    id = "my_feature"
+    name = "내 기능"
+    description = "기능 설명"
+    category = "General"
+    order = 100
+    default_enabled = False
+
+    def register(self):
+        # Register once; callback checks the feature toggle each time.
+        self.ctx.subscribe(
+            "generation_request_dispatched",
+            self.on_generation,
+        )
+
+    def on_generation(self, info):
+        if not self.is_enabled():
+            return
+
+        # Recommended recursion guard for generation-derived features.
+        if isinstance(info, dict) and info.get("ext_origin"):
+            return
+
+        # Actual feature logic here.
+
+    def panel_fields(self):
+        return [
+            {
+                "key": "example_option",
+                "type": "bool",
+                "default": True,
+                "label": "예제 옵션",
+                "visible_when": {
+                    "field": "__enabled__",
+                    "in": [True],
+                },
+            }
+        ]

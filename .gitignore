@@ -1,0 +1,14 @@
+# Local NAIA runtime state
+settings.json
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environments and editor files
+.venv/
+venv/
+.idea/
+.vscode/
+*.log
