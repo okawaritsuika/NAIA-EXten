@@ -32,7 +32,7 @@ NAIA-EXten/
 2. NAIA 실행.
 3. **Settings ▸ Extension**으로 이동.
 4. 저장소 URL 입력:
-   `https://github.com/<owner>/<repo>`
+   `https://github.com/okawaritsuika/NAIA-EXten`
 5. **GitHub에서 설치** 클릭.
 6. 설치 후 목록에 `NAIA 추가 편의기능`이 **미승인** 상태로 나타납니다.
 7. 신뢰 경고를 확인하고 승인/활성화합니다.
