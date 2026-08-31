@@ -44,12 +44,70 @@ class ComicMakerFeature(BaseFeature):
     panel_toggle_visible = False
 
     SERVER_BASE = "http://127.0.0.1:8765"
+    _PANEL_STYLE_MARKER = "/* NAIA_EXTEN_COMIC_MAKER_CONFIRM_V1 */"
+    _PANEL_STYLE = _PANEL_STYLE_MARKER + r"""
+.ext-quick-popup .ext-field:has(> textarea[data-field="feature__comic_maker__summary"]) {
+  display: block;
+  min-height: 0;
+  margin: 2px 0 4px;
+  padding: 9px 11px;
+  border: 1px solid var(--border-dim);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+}
+.ext-quick-popup .ext-field:has(> textarea[data-field="feature__comic_maker__summary"]) > label {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--accent-light);
+  font-weight: 750;
+  white-space: nowrap;
+}
+.ext-quick-popup textarea[data-field="feature__comic_maker__summary"] {
+  display: block;
+  width: 100%;
+  min-height: 40px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  resize: none;
+  pointer-events: none;
+  background: transparent;
+  color: var(--text-primary);
+  line-height: 1.55;
+}
+.ext-quick-popup textarea[data-field="feature__comic_maker__summary"]::placeholder {
+  color: var(--text-primary);
+  opacity: 1;
+}
+.ext-quick-popup .ext-field:has(> input[type="checkbox"][data-field$="__enabled"]) {
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 12px;
+}
+.ext-quick-popup .ext-field:has(> input[type="checkbox"][data-field$="__enabled"]) > label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  width: max-content;
+  max-width: 100%;
+  white-space: nowrap;
+}
+.ext-quick-popup .ext-field:has(> input[type="checkbox"][data-field$="__enabled"]) > label .ext-help-mark {
+  display: inline-block;
+  flex: 0 0 auto;
+  margin-left: 2px;
+  white-space: nowrap;
+}
+.ext-quick-popup .ext-field:has(> input[type="checkbox"][data-field$="__enabled"]) > input[type="checkbox"] {
+  grid-column: 2;
+  justify-self: end;
+  margin: 0 6px 0 0;
+}
+"""
     # NAI maximum portrait canvas used by Comic Maker.  ComicPlan geometry is
     # normalized (0..1), so server-side preset dimensions can be safely mapped
     # to this single output resolution for every page.
     COMIC_WIDTH = 832
     COMIC_HEIGHT = 1216
-    _NEVER = "__comic_maker_internal_never__"
     _INHERITED_PARAM_KEYS = (
         "model", "sampler", "scheduler", "steps", "cfg_scale", "scale",
         "cfg_rescale", "SMEA", "DYN", "VAR+", "DECRISP", "seed_fixed",
@@ -65,6 +123,12 @@ class ComicMakerFeature(BaseFeature):
         self._active_run: _ComicRun | None = None
 
     def register(self) -> None:
+        self.ext.patches.add_web_injection(
+            owner=self.id,
+            file_name="style.css",
+            marker=self._PANEL_STYLE_MARKER,
+            content=self._PANEL_STYLE,
+        )
         self.ctx.subscribe("generation_result_available", self.on_generation_result)
 
     def unregister(self) -> None:
@@ -73,12 +137,43 @@ class ComicMakerFeature(BaseFeature):
             self._active_run = None
 
     def panel_fields(self) -> list[dict]:
-        hidden = {"field": self._NEVER, "in": ["1"]}
+        with self._run_lock:
+            pending = self._pending
+        if pending is not None:
+            plan = pending.plan
+            summary = (
+                f"{plan['page_count']}페이지 · {plan['width']} × {plan['height']}\n"
+                f"캐릭터: girl {plan['female_count']}명 · boy {plan['male_count']}명"
+            )
+            return [
+                {
+                    "key": "summary",
+                    "type": "text",
+                    "label": "생성 정보",
+                    "default": "",
+                    "placeholder": summary,
+                    "multiline": True,
+                    "section": self.category,
+                    "help": "만들기 전에 확인할 페이지·해상도·캐릭터 정보입니다.",
+                },
+                {
+                    "key": "confirm",
+                    "type": "action",
+                    "label": "✓ 이 설정으로 만들기",
+                    "help": summary,
+                    "section": self.category,
+                },
+                {
+                    "key": "cancel",
+                    "type": "action",
+                    "label": "취소",
+                    "help": "준비한 만화 계획을 버리고 이전 화면으로 돌아갑니다.",
+                    "section": self.category,
+                },
+            ]
         return [
             {"key": "make", "type": "action", "label": "만화 만들기",
              "help": "활성 캐릭터 수로 계획을 받아 확인 후 모든 페이지를 연속 생성합니다."},
-            {"key": "confirm", "type": "action", "label": "확인", "visible_when": hidden},
-            {"key": "cancel", "type": "action", "label": "취소", "visible_when": hidden},
         ]
 
     def handle_action(self, full_key: str) -> None:
@@ -89,12 +184,19 @@ class ComicMakerFeature(BaseFeature):
         elif full_key == self.key("cancel"):
             with self._run_lock:
                 self._pending = None
+            self._refresh_panel()
 
     def _toast(self, message: str, level: str = "info") -> None:
         try:
             self.ctx.show_toast(message, level)
         except Exception:
             self.ctx.log(message)
+
+    def _refresh_panel(self) -> None:
+        try:
+            self.ext.refresh_panel()
+        except Exception as exc:
+            self.ctx.log(f"Comic Maker 패널 갱신 실패: {exc}")
 
     @staticmethod
     def _gender(prompt: str) -> str:
@@ -162,29 +264,16 @@ class ComicMakerFeature(BaseFeature):
         pending = _PendingComic(plan, current, prompts, ucs, positions)
         with self._run_lock:
             self._pending = pending
-        try:
-            shown = self.ctx.request_confirmation(
-                f"{plan['page_count']}페이지 만화를 만들까요?\n"
-                f"해상도: {plan['width']} × {plan['height']}\n"
-                f"캐릭터: girl {female_count}명 · boy {male_count}명",
-                title="Comic Maker",
-                confirm_action=self.key("confirm"),
-                cancel_action=self.key("cancel"),
-                confirm_label="만들기",
-            )
-            if shown is False:
-                raise RuntimeError("확장이 작동 OFF 상태입니다")
-        except Exception as exc:
-            with self._run_lock:
-                self._pending = None
-            self._toast(f"확인 창을 열지 못했습니다. NAIA를 재시작해주세요: {exc}", "error")
+        self._refresh_panel()
 
     def _start_pending(self) -> None:
         with self._run_lock:
             pending = self._pending
             self._pending = None
-            if pending is None or self._active_run is not None:
-                return
+            can_start = pending is not None and self._active_run is None
+        self._refresh_panel()
+        if not can_start:
+            return
         run = _ComicRun(pending=pending, output_dir=self._create_output_dir(pending.plan))
         with self._run_lock:
             self._active_run = run
@@ -199,9 +288,7 @@ class ComicMakerFeature(BaseFeature):
             for page in pending.plan["pages"]:
                 self._enqueue_page(run, page)
             run.enqueued_complete = True
-            started = self.ctx.start_generation_queue()
-            if not started.get("ok"):
-                raise RuntimeError(started.get("message") or "생성 큐 시작 실패")
+            self._start_generation_queue(run)
         except Exception as exc:
             self._abort_run(run, f"Comic Maker 시작 실패: {exc}")
             return
@@ -213,6 +300,49 @@ class ComicMakerFeature(BaseFeature):
             self._finish_run(run)
             return
         self._toast(f"{pending.plan['page_count']}페이지 만화 생성을 시작했습니다.", "success")
+
+    def _start_generation_queue(self, run: _ComicRun) -> None:
+        """Wake the host queue on both newer and older NAIA extension APIs."""
+        starter = getattr(self.ctx, "start_generation_queue", None)
+        if callable(starter):
+            started = starter()
+            if not isinstance(started, dict) or not started.get("ok"):
+                message = started.get("message") if isinstance(started, dict) else ""
+                raise RuntimeError(message or "생성 큐 시작 실패")
+            return
+
+        params = run.pending.current.get("params")
+        raw_port = params.get("web_session_port") if isinstance(params, dict) else None
+        try:
+            port = int(raw_port or 7243)
+        except (TypeError, ValueError):
+            port = 7243
+        if not 1 <= port <= 65535:
+            port = 7243
+        threading.Thread(
+            target=self._resume_generation_queue,
+            args=(run, port),
+            daemon=True,
+            name="comic-maker-queue-resume",
+        ).start()
+
+    def _resume_generation_queue(self, run: _ComicRun, port: int) -> None:
+        """Use the host's existing queue-resume HTTP route without blocking its WS loop."""
+        from urllib.request import Request, urlopen
+
+        request = Request(
+            f"http://127.0.0.1:{port}/api/queue/action",
+            data=json.dumps({"action": "resume"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=10) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if not isinstance(payload, dict) or payload.get("ok") is not True:
+                raise RuntimeError("큐 재개 응답이 올바르지 않습니다")
+        except Exception as exc:
+            self._abort_run(run, f"Comic Maker 큐 시작 실패: {exc}")
 
     @staticmethod
     def _join(parts: list[Any]) -> str:

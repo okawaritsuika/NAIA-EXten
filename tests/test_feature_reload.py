@@ -94,6 +94,8 @@ class FeatureReloadTests(unittest.TestCase):
             toggles["feature__parquet_live_sync__enabled"].get("visible_when", {}).get("in"),
             ["1"],
         )
+        for toggle in toggles.values():
+            self.assertNotIn(" ", str(toggle.get("label") or ""))
         for field in panel_fields:
             key = str(field.get("key", ""))
             if key.startswith("feature__") and not key.endswith("__enabled"):
@@ -123,6 +125,15 @@ class FeatureReloadTests(unittest.TestCase):
             for item in patches
             if item["target"] == "web" and item["method"] == "inject:app.js"
         ]
+        style_injections = [
+            item
+            for item in patches
+            if item["target"] == "web" and item["method"] == "inject:style.css"
+        ]
+        self.assertTrue(
+            any(item.get("owner") == "comic_maker" for item in style_injections),
+            style_injections,
+        )
         self.assertEqual(
             {item["owner"] for item in app_js_injections},
             {

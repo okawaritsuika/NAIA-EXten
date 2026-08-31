@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -129,7 +130,6 @@ class _FakeContext:
         self.toasts = []
         self.logs = []
         self.queue_starts = 0
-        self.confirmations = []
         self.current_params = {
             "pre_prompt": "masterpiece, clean lineart",
             "post_prompt": "high detail",
@@ -157,10 +157,6 @@ class _FakeContext:
 
     def resolve_nai_characters(self):
         return copy.deepcopy(self.character_snapshot)
-
-    def request_confirmation(self, message, **kwargs):
-        self.confirmations.append((message, kwargs))
-        return True
 
     def enqueue_generation(self, **kwargs):
         request_id = f"req-{len(self.enqueued) + 1}"
@@ -286,13 +282,18 @@ class ComicMakerTests(unittest.TestCase):
             feature._prepare()
             self.assertEqual(set(client.queries[0]), {"male_count", "female_count", "mark_used"})
             self.assertEqual((client.queries[0]["male_count"], client.queries[0]["female_count"]), (1, 1))
-            self.assertEqual(len(ctx.confirmations), 1)
-            self.assertIn("1페이지", ctx.confirmations[0][0])
-            self.assertIn("832 × 1216", ctx.confirmations[0][0])
+            confirmation = feature.panel_fields()
+            self.assertEqual(
+                [field["key"] for field in confirmation], ["summary", "confirm", "cancel"]
+            )
+            self.assertEqual(confirmation[0]["section"], "Comic Maker")
+            self.assertIn("1페이지", confirmation[0]["placeholder"])
+            self.assertIn("832 × 1216", confirmation[0]["placeholder"])
 
             feature._start_pending()
             self.assertEqual(len(ctx.enqueued), 1)
             self.assertEqual(ctx.queue_starts, 1)
+            self.assertEqual([field["key"] for field in feature.panel_fields()], ["make"])
             self.assertFalse(client.queries[0]["mark_used"])
             first_overrides = ctx.enqueued[0][1]["overrides"]
             self.assertEqual((first_overrides["width"], first_overrides["height"]), (832, 1216))
@@ -320,6 +321,56 @@ class ComicMakerTests(unittest.TestCase):
             self.assertEqual(len(pages), 1)
             with Image.open(pages[0]) as saved:
                 self.assertEqual(saved.size, (832, 1216))
+
+    def test_confirmation_panel_cancel_returns_to_make_action(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = _FakeContext(Path(temp_dir))
+            refreshes = []
+            feature = ComicMakerFeature()
+            feature._attach(SimpleNamespace(ctx=ctx, refresh_panel=lambda: refreshes.append(True)))
+            feature._client = _FakeClient(comic_plan())
+
+            feature._prepare()
+            feature.handle_action(feature.key("cancel"))
+
+            self.assertIsNone(feature._pending)
+            self.assertEqual([field["key"] for field in feature.panel_fields()], ["make"])
+            self.assertEqual(ctx.enqueued, [])
+            self.assertEqual(ctx.queue_starts, 0)
+            self.assertEqual(len(refreshes), 2)
+
+    def test_panel_style_keeps_enabled_help_inline_and_checkbox_at_right(self):
+        style = ComicMakerFeature._PANEL_STYLE
+
+        self.assertIn('input[type="checkbox"][data-field$="__enabled"]', style)
+        self.assertIn("display: inline-flex", style)
+        self.assertIn("white-space: nowrap", style)
+        self.assertIn("justify-self: end", style)
+        self.assertIn("margin: 0 6px 0 0", style)
+
+    def test_old_host_resumes_queue_through_background_http_compatibility(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = _FakeContext(Path(temp_dir))
+            ctx.start_generation_queue = None
+            ctx.current_params["web_session_port"] = 8123
+            resumed = []
+            completed = threading.Event()
+            feature = ComicMakerFeature()
+            feature._attach(SimpleNamespace(ctx=ctx, refresh_panel=lambda: None))
+            feature._client = _FakeClient(comic_plan())
+
+            def resume(run, port):
+                resumed.append((run, port))
+                completed.set()
+
+            feature._resume_generation_queue = resume
+            feature._prepare()
+            feature._start_pending()
+
+            self.assertTrue(completed.wait(1))
+            self.assertEqual(resumed[0][1], 8123)
+            self.assertEqual(len(ctx.enqueued), 1)
+            self.assertEqual(ctx.queue_starts, 0)
 
     def test_multiple_pages_reuse_the_same_fixed_character_snapshot(self):
         with tempfile.TemporaryDirectory() as temp_dir:

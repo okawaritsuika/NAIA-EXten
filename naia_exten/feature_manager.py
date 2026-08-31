@@ -226,12 +226,13 @@ class FeatureManager:
 
         for feature in self.features.values():
             toggle_key = feature.enabled_key
+            toggle_label = f"{feature.name} 활성화".replace(" ", "\u00a0")
 
             toggle_field = {
                 "key": toggle_key,
                 "type": "bool",
                 "default": feature.default_enabled,
-                "label": f"{feature.name} 활성화",
+                "label": toggle_label,
                 "help": feature.description,
                 "section": feature.category,
                 "order": feature.order * 100,
