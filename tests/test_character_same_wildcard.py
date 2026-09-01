@@ -226,6 +226,8 @@ class CharacterSameWildcardTests(unittest.TestCase):
         self.assertIn("__naiaExtenCharacterSameWildcardPanelV4", CharacterSameWildcardFeature._PANEL_JS)
         self.assertIn("다시 동기화", CharacterSameWildcardFeature._PANEL_JS)
         self.assertIn("feature__character_same_wildcard__resync_now", CharacterSameWildcardFeature._PANEL_JS)
+        self.assertNotIn("renderExtensions =", CharacterSameWildcardFeature._PANEL_JS)
+        self.assertNotIn("subtree: true", CharacterSameWildcardFeature._PANEL_JS)
 
 
 if __name__ == "__main__":

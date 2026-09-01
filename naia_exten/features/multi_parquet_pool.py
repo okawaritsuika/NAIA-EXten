@@ -1057,6 +1057,7 @@ class MultiParquetPoolFeature(BaseFeature):
         return;
       }
       requestExtensionState();
+      setTimeout(onExtensionEcho, 120);
     }, 650);
   }
 
@@ -1112,18 +1113,6 @@ class MultiParquetPoolFeature(BaseFeature):
     hookAttempts += 1;
     if (installSearchLifecycleHook() || hookAttempts >= 20) clearInterval(hookTimer);
   }, 100);
-
-  try {
-    const originalRenderExtensions = renderExtensions;
-    renderExtensions = function(m) {
-      const result = originalRenderExtensions(m);
-      queueMicrotask(() => {
-        ensureRoot();
-        onExtensionEcho();
-      });
-      return result;
-    };
-  } catch (_) {}
 
   document.addEventListener('keydown', event => {
     if (event.key === 'Escape' && document.getElementById(MODAL_ID)) closeModal();

@@ -29,6 +29,12 @@ class _SearchResults:
 
 
 class GSQEProbabilityTests(unittest.TestCase):
+    def test_panel_does_not_replace_naia_extensions_renderer(self):
+        script = GSQEProbabilityFeature._PANEL_JS
+        self.assertNotIn("renderExtensions =", script)
+        self.assertIn(".observe(moduleBody, {childList: true})", script)
+        self.assertNotIn("subtree: true", script)
+
     def test_bundled_weights_override_legacy_fields(self):
         class _Context:
             @staticmethod

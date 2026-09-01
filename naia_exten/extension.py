@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from .feature_manager import FeatureManager
@@ -12,6 +13,57 @@ class NAIAExten:
     """Integrated extension runtime with safe feature-level development hot reload."""
 
     PANEL_TITLE = "NAIA 추가 편의기능"
+
+    PANEL_LAYOUT_CSS_MARKER = "/* NAIA_EXTEN_PANEL_TOGGLE_LAYOUT_V2 */"
+    PANEL_LAYOUT_JS_MARKER = "/* NAIA_EXTEN_PANEL_TOGGLE_LAYOUT_RUNTIME_V2 */"
+    PANEL_LAYOUT_STYLE_ID = "naiaExtenPanelToggleLayoutV2"
+    PANEL_LAYOUT_CSS = r'''/* NAIA_EXTEN_PANEL_TOGGLE_LAYOUT_V2 */
+/* Keep EXten's four visible feature toggles on one clean label/switch row.
+   Select by extension + field key so NAIA's own extension UI is untouched. */
+.ext-quick-popup .ext-field:has(> #extquick-naia_exten-feature__character_same_wildcard__enabled),
+.ext-quick-popup .ext-field:has(> #extquick-naia_exten-feature__server_random_prompt__enabled),
+.ext-quick-popup .ext-field:has(> #extquick-naia_exten-feature__multi_parquet_pool__enabled),
+.ext-quick-popup .ext-field:has(> #extquick-naia_exten-feature__gsqe_probability__enabled) {
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) auto !important;
+  align-items: center !important;
+  column-gap: 10px !important;
+}
+.ext-quick-popup .ext-field:has(> #extquick-naia_exten-feature__character_same_wildcard__enabled) > label,
+.ext-quick-popup .ext-field:has(> #extquick-naia_exten-feature__server_random_prompt__enabled) > label,
+.ext-quick-popup .ext-field:has(> #extquick-naia_exten-feature__multi_parquet_pool__enabled) > label,
+.ext-quick-popup .ext-field:has(> #extquick-naia_exten-feature__gsqe_probability__enabled) > label {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  white-space: nowrap !important;
+}
+.ext-quick-popup .ext-field:has(> #extquick-naia_exten-feature__character_same_wildcard__enabled) > input[type="checkbox"],
+.ext-quick-popup .ext-field:has(> #extquick-naia_exten-feature__server_random_prompt__enabled) > input[type="checkbox"],
+.ext-quick-popup .ext-field:has(> #extquick-naia_exten-feature__multi_parquet_pool__enabled) > input[type="checkbox"],
+.ext-quick-popup .ext-field:has(> #extquick-naia_exten-feature__gsqe_probability__enabled) > input[type="checkbox"] {
+  grid-column: 2 !important;
+  justify-self: end !important;
+  margin: 0 !important;
+}
+'''
+
+    @classmethod
+    def _panel_layout_js(cls) -> str:
+        css = json.dumps(cls.PANEL_LAYOUT_CSS, ensure_ascii=False)
+        return f'''{cls.PANEL_LAYOUT_JS_MARKER}
+(() => {{
+  const styleId = {json.dumps(cls.PANEL_LAYOUT_STYLE_ID)};
+  let style = document.getElementById(styleId);
+  if (!style) {{
+    style = document.createElement('style');
+    style.id = styleId;
+    document.head.appendChild(style);
+  }}
+  style.textContent = {css};
+}})();
+'''
 
     HOT_RELOAD_KEY = "core__hot_reload_enabled"
     HOT_RELOAD_ACTION = "core__reload_features_now"
@@ -91,6 +143,24 @@ class NAIAExten:
         ]
 
     def refresh_panel(self) -> None:
+        # This is extension-owned presentation only. Register it here (rather
+        # than in a feature) so a feature hot reload restores it after
+        # PatchManager clears and rebuilds the web injection set.
+        self.patches.add_web_injection(
+            owner="__naia_exten_panel_layout__",
+            file_name="style.css",
+            marker=self.PANEL_LAYOUT_CSS_MARKER,
+            content=self.PANEL_LAYOUT_CSS,
+        )
+        # Install the same rule from app.js as well. Electron can retain an
+        # older stylesheet in the current page, while this extension-owned
+        # runtime style is appended after the host CSS on the normal reload.
+        self.patches.add_web_injection(
+            owner="__naia_exten_panel_layout__",
+            file_name="app.js",
+            marker=self.PANEL_LAYOUT_JS_MARKER,
+            content=self._panel_layout_js(),
+        )
         fields = self._core_panel_fields() + self.features.build_panel_fields()
         self.ctx.register_panel(
             fields=fields,

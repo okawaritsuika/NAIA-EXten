@@ -450,20 +450,12 @@ class GSQEProbabilityFeature(BaseFeature):
     }
   }, true);
 
-  try {
-    const previousRenderExtensions = renderExtensions;
-    renderExtensions = function(m) {
-      const result = previousRenderExtensions(m);
-      queueMicrotask(() => {
-        if (Date.now() >= savingUntil) {
-          weights = readRawWeights();
-          lastSavedWeights = {...weights};
-        }
-        ensureUI();
-      });
-      return result;
-    };
-  } catch (_) {}
+  // Tag Filter replaces moduleBody's direct children when it opens. Observe
+  // that boundary only; never replace NAIA's global Extensions renderer.
+  if (typeof moduleBody !== 'undefined' && moduleBody) {
+    new MutationObserver(() => queueMicrotask(ensureUI))
+      .observe(moduleBody, {childList: true});
+  }
 
   queueMicrotask(ensureUI);
   setTimeout(ensureUI, 250);

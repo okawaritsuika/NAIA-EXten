@@ -19,6 +19,7 @@ for path in (EXTENSION_ROOT, BACKEND_ROOT):
 from naia_exten.feature_manager import FeatureManager
 from naia_exten.host_bridge import HostBridge
 from naia_exten.patch_manager import PatchManager
+from naia_exten.extension import NAIAExten
 
 
 class _Context:
@@ -47,6 +48,32 @@ class _Context:
 
 
 class FeatureReloadTests(unittest.TestCase):
+    def test_panel_layout_css_targets_only_the_four_visible_feature_toggles(self):
+        css = NAIAExten.PANEL_LAYOUT_CSS
+        expected = {
+            "feature__character_same_wildcard__enabled",
+            "feature__server_random_prompt__enabled",
+            "feature__multi_parquet_pool__enabled",
+            "feature__gsqe_probability__enabled",
+        }
+
+        self.assertEqual(
+            {
+                key
+                for key in expected
+                if f'#extquick-naia_exten-{key}' in css
+            },
+            expected,
+        )
+        self.assertIn("white-space: nowrap !important", css)
+        self.assertIn("grid-template-columns: minmax(0, 1fr) auto !important", css)
+        self.assertIn("justify-self: end !important", css)
+
+        runtime_js = NAIAExten._panel_layout_js()
+        self.assertIn(NAIAExten.PANEL_LAYOUT_JS_MARKER, runtime_js)
+        self.assertIn(NAIAExten.PANEL_LAYOUT_STYLE_ID, runtime_js)
+        self.assertIn(NAIAExten.PANEL_LAYOUT_CSS_MARKER, runtime_js)
+
     def test_all_features_register_and_reload_without_patch_conflicts(self):
         with patch.dict(sys.modules, self._host_modules()), tempfile.TemporaryDirectory() as temp_dir:
             ctx = _Context(Path(temp_dir))
@@ -145,6 +172,22 @@ class FeatureReloadTests(unittest.TestCase):
             },
         )
         self.assertEqual(len(app_js_injections), 5)
+
+        scripts = {
+            item.owner: item.content
+            for item in ext.patches._web_injections
+            if item.file_name == "app.js"
+        }
+        for owner in {
+            "parquet_live_sync",
+            "character_same_wildcard",
+            "multi_parquet_pool",
+            "gsqe_probability",
+            "server_random_prompt",
+        }:
+            self.assertNotIn("renderExtensions =", scripts[owner], owner)
+        self.assertNotIn("subtree: true", scripts["parquet_live_sync"])
+        self.assertNotIn("subtree: true", scripts["character_same_wildcard"])
 
         pop_layers = [
             item

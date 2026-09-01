@@ -119,6 +119,23 @@ class ParquetLiveSyncFeature(BaseFeature):
                 "if (!available) requestExtensionState();",
                 "if (!ext) requestExtensionState();",
             )
+            injected_js = injected_js.replace(
+                ").observe(moduleBody, { childList: true, subtree: true });",
+                ").observe(moduleBody, { childList: true });",
+            )
+            wrapper_start = injected_js.find(
+                "  // Keep the Search switch synchronized when the Extensions state changes,"
+            )
+            wrapper_end = injected_js.find(
+                "  // Initial/open-panel fallback.",
+                wrapper_start,
+            )
+            if wrapper_start >= 0 and wrapper_end > wrapper_start:
+                injected_js = (
+                    injected_js[:wrapper_start]
+                    + "  // Keep NAIA's global Extensions renderer untouched.\n"
+                    + injected_js[wrapper_end:]
+                )
             self.ext.patches.add_web_injection(
                 owner=self.id,
                 file_name="app.js",

@@ -210,15 +210,14 @@ class ServerRandomPromptTests(unittest.TestCase):
         )
         self.assertTrue(all(field.get("visible_when") for field in fields))
 
-    def test_panel_injection_uses_prompt_render_boundary_not_dom_observer(self):
+    def test_panel_injection_observes_only_module_body_boundary(self):
         script = ServerRandomPromptFeature._PANEL_JS
 
         self.assertEqual(
             ServerRandomPromptFeature._PANEL_JS_MARKER,
-            "/* NAIA_EXTEN_SERVER_RANDOM_PROMPT_PANEL_V5 */",
+            "/* NAIA_EXTEN_SERVER_RANDOM_PROMPT_PANEL_V6 */",
         )
-        self.assertIn("__naiaExtenServerRandomPromptPanelV5", script)
-        self.assertIn("previousRenderPromptEngineering", script)
+        self.assertIn("__naiaExtenServerRandomPromptPanelV6", script)
         self.assertIn("data-server-mark-used", script)
         self.assertIn("data-server-include-used", script)
         self.assertIn("MARK_USED_KEY", script)
@@ -232,9 +231,15 @@ class ServerRandomPromptTests(unittest.TestCase):
         self.assertIn("char의 girl/boy 태그로 인원 수를 자동 판별", script)
         self.assertNotIn("data-server-male", script)
         self.assertNotIn("data-server-female", script)
-        self.assertNotIn("new MutationObserver", script)
+        self.assertIn("new MutationObserver", script)
+        self.assertIn(".observe(moduleBody, {childList: true})", script)
+        self.assertNotIn("subtree: true", script)
+        self.assertNotIn("previousRenderPromptEngineering", script)
+        self.assertNotIn("renderPromptEngineering =", script)
+        self.assertNotIn("previousRenderExtensions", script)
+        self.assertNotIn("renderExtensions =", script)
         ensure_start = script.index("function ensureRow()")
-        ensure_end = script.index("// Prompt Engineering owns", ensure_start)
+        ensure_end = script.index("// Prompt Engineering replaces", ensure_start)
         ensure_body = script[ensure_start:ensure_end]
         self.assertGreater(
             ensure_body.index("const currentPreset = row.querySelector"),

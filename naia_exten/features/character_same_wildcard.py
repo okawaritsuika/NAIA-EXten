@@ -258,20 +258,8 @@ class CharacterSameWildcardFeature(BaseFeature):
 
   if (typeof moduleBody !== 'undefined' && moduleBody) {
     new MutationObserver(() => queueMicrotask(ensureRow))
-      .observe(moduleBody, {childList: true, subtree: true});
+      .observe(moduleBody, {childList: true});
   }
-
-  try {
-    const previousRenderExtensions = renderExtensions;
-    renderExtensions = function(m) {
-      const result = previousRenderExtensions(m);
-      queueMicrotask(() => {
-        ensureRow();
-        syncRowState();
-      });
-      return result;
-    };
-  } catch (_) {}
 
   queueMicrotask(ensureRow);
   setTimeout(ensureRow, 250);

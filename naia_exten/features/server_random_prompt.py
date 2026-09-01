@@ -67,7 +67,7 @@ class ServerRandomPromptFeature(BaseFeature):
     APPLIED_ATTR = "_naia_exten_server_random_prompt_base_applied"
     FEATURE_ATTR = "_naia_exten_server_random_prompt_feature"
     HOOK_ATTR = "_naia_exten_server_random_prompt_hook"
-    _PANEL_JS_MARKER = "/* NAIA_EXTEN_SERVER_RANDOM_PROMPT_PANEL_V5 */"
+    _PANEL_JS_MARKER = "/* NAIA_EXTEN_SERVER_RANDOM_PROMPT_PANEL_V6 */"
     REQUEST_TIMEOUT = 0.8
     _GENDER_TAG_RE = re.compile(
         r"^(?P<count>\d+\+?|)?(?P<gender>boys?|girls?)$",
@@ -77,10 +77,10 @@ class ServerRandomPromptFeature(BaseFeature):
     _REQUESTED_MALE_COUNT_KEY = "_naia_exten_requested_male_count"
     _REQUESTED_FEMALE_COUNT_KEY = "_naia_exten_requested_female_count"
 
-    _PANEL_JS = r'''/* NAIA_EXTEN_SERVER_RANDOM_PROMPT_PANEL_V5 */
+    _PANEL_JS = r'''/* NAIA_EXTEN_SERVER_RANDOM_PROMPT_PANEL_V6 */
 (() => {
-  if (window.__naiaExtenServerRandomPromptPanelV5) return;
-  window.__naiaExtenServerRandomPromptPanelV5 = true;
+  if (window.__naiaExtenServerRandomPromptPanelV6) return;
+  window.__naiaExtenServerRandomPromptPanelV6 = true;
 
   const EXT_ID = 'naia_exten';
   const ENABLED_KEY = 'feature__server_random_prompt__enabled';
@@ -265,22 +265,14 @@ class ServerRandomPromptFeature(BaseFeature):
     if (currentPreset && currentPreset.dataset.serverPresetsLoaded !== 'true') void loadPresets(currentPreset);
     syncRow();
   }
-  // Prompt Engineering owns moduleBody.innerHTML and exposes a stable render
-  // boundary. Inject after that render instead of observing every subtree
-  // mutation: custom select enhancement also mutates this subtree and can keep
-  // an observer callback chain busy enough to freeze the popup open action.
-  try {
-    const previousRenderPromptEngineering = renderPromptEngineering;
-    renderPromptEngineering = function(m) {
-      const result = previousRenderPromptEngineering(m);
-      queueMicrotask(ensureRow);
-      return result;
-    };
-  } catch (_) {}
-  try {
-    const previousRenderExtensions = renderExtensions;
-    renderExtensions = function(m) { const result = previousRenderExtensions(m); queueMicrotask(() => { ensureRow(); syncRow(); }); return result; };
-  } catch (_) {}
+  // Prompt Engineering replaces moduleBody's direct children on render. Watch
+  // only that boundary: subtree:false deliberately ignores custom-select DOM
+  // updates, and avoiding renderPromptEngineering monkey-patching keeps the host
+  // renderer intact when the extension is disabled and enabled again.
+  if (typeof moduleBody !== 'undefined' && moduleBody) {
+    new MutationObserver(() => queueMicrotask(ensureRow))
+      .observe(moduleBody, {childList: true});
+  }
   queueMicrotask(ensureRow);
   setTimeout(ensureRow, 250);
   setTimeout(ensureRow, 1000);
