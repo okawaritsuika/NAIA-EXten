@@ -218,16 +218,14 @@ class CharacterSameWildcardTests(unittest.TestCase):
 
         self.assertEqual(calls, [(app_context, "NAI", False)])
 
-    def test_character_panel_injects_resync_button_and_action_route(self):
+    def test_extension_panel_exposes_resync_action_when_enabled(self):
         fields = CharacterSameWildcardFeature().panel_fields()
         self.assertEqual(fields[0]["type"], "action")
         self.assertEqual(fields[0]["key"], "resync_now")
-        self.assertIn("CHARACTER_SAME_WILDCARD_PANEL_V4", CharacterSameWildcardFeature._PANEL_JS_MARKER)
-        self.assertIn("__naiaExtenCharacterSameWildcardPanelV4", CharacterSameWildcardFeature._PANEL_JS)
-        self.assertIn("다시 동기화", CharacterSameWildcardFeature._PANEL_JS)
-        self.assertIn("feature__character_same_wildcard__resync_now", CharacterSameWildcardFeature._PANEL_JS)
-        self.assertNotIn("renderExtensions =", CharacterSameWildcardFeature._PANEL_JS)
-        self.assertNotIn("subtree: true", CharacterSameWildcardFeature._PANEL_JS)
+        self.assertEqual(
+            fields[0]["visible_when"],
+            {"field": "__enabled__", "in": [True]},
+        )
 
 
 if __name__ == "__main__":

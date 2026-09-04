@@ -27,245 +27,6 @@ class CharacterSameWildcardFeature(BaseFeature):
     SERVER_RESPONSE_METADATA_KEY = "naia_exten_server_random_prompt_response"
     RESYNC_ACTION = "resync_now"
 
-    _PANEL_JS_MARKER = "/* NAIA_EXTEN_CHARACTER_SAME_WILDCARD_PANEL_V4 */"
-    _PANEL_JS = r'''/* NAIA_EXTEN_CHARACTER_SAME_WILDCARD_PANEL_V4 */
-(() => {
-  if (window.__naiaExtenCharacterSameWildcardPanelV4) return;
-  window.__naiaExtenCharacterSameWildcardPanelV4 = true;
-
-  const EXT_ID = 'naia_exten';
-  const SETTING_KEY = 'feature__character_same_wildcard__enabled';
-  const ROW_ID = 'naiaExtenCharacterSameWildcardRow';
-  const STYLE_ID = 'naiaExtenCharacterSameWildcardStyle';
-
-  function extensionState() {
-    const list = Array.isArray(lastExtensionsState?.extensions)
-      ? lastExtensionsState.extensions
-      : [];
-    return list.find(item => item?.id === EXT_ID) || null;
-  }
-
-  function enabledValue() {
-    return Boolean(extensionState()?.settings?.[SETTING_KEY]);
-  }
-
-  function requestExtensionState() {
-    try {
-      if (typeof requestModuleState === 'function') requestModuleState('extensions');
-    } catch (_) {}
-  }
-
-  function setEnabled(checked) {
-    const ext = extensionState();
-    if (ext) {
-      if (!ext.settings || typeof ext.settings !== 'object') ext.settings = {};
-      ext.settings[SETTING_KEY] = Boolean(checked);
-    }
-    setModuleParam('extensions', `setting:${EXT_ID}:${SETTING_KEY}`, Boolean(checked));
-  }
-
-  function installStyle() {
-    if (document.getElementById(STYLE_ID)) return;
-    const style = document.createElement('style');
-    style.id = STYLE_ID;
-    style.textContent = `
-      #${ROW_ID} {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-        min-height: 38px;
-        margin: 2px 0 8px;
-        padding: 7px 10px;
-        border: 1px solid var(--border-dim);
-        border-radius: 8px;
-        background: color-mix(in srgb, var(--bg-surface) 82%, transparent);
-      }
-      #${ROW_ID} .naia-exten-character-label-wrap { min-width: 0; }
-      #${ROW_ID} .naia-exten-character-controls { display:flex; align-items:center; gap:8px; flex:0 0 auto; }
-      #${ROW_ID} .naia-exten-character-label {
-        display: block;
-        color: var(--text-primary);
-        font-size: 12px;
-        font-weight: 650;
-        line-height: 1.3;
-      }
-      #${ROW_ID} .naia-exten-character-help {
-        display: block;
-        margin-top: 2px;
-        color: var(--text-muted);
-        font-size: 10px;
-        line-height: 1.25;
-      }
-      #${ROW_ID} .naia-exten-character-switch {
-        position: relative;
-        display: inline-block;
-        flex: 0 0 auto;
-        width: 42px;
-        height: 23px;
-        cursor: pointer;
-      }
-      #${ROW_ID} .naia-exten-character-switch input {
-        position: absolute;
-        opacity: 0;
-        width: 1px;
-        height: 1px;
-        pointer-events: none;
-      }
-      #${ROW_ID} .naia-exten-character-track {
-        position: absolute;
-        inset: 0;
-        border: 1px solid var(--border-dim);
-        border-radius: 999px;
-        background: var(--bg-elevated);
-        transition: background .15s ease, border-color .15s ease;
-      }
-      #${ROW_ID} .naia-exten-character-track::after {
-        content: '';
-        position: absolute;
-        top: 2px;
-        left: 2px;
-        width: 17px;
-        height: 17px;
-        border-radius: 50%;
-        background: var(--text-muted);
-        transition: transform .15s ease, background .15s ease;
-      }
-      #${ROW_ID} input:checked + .naia-exten-character-track {
-        background: color-mix(in srgb, var(--accent) 72%, var(--bg-elevated));
-        border-color: var(--accent);
-      }
-      #${ROW_ID} input:checked + .naia-exten-character-track::after {
-        transform: translateX(19px);
-        background: #fff;
-      }
-      #${ROW_ID} input:focus-visible + .naia-exten-character-track {
-        outline: 2px solid var(--accent);
-        outline-offset: 2px;
-      }
-      #${ROW_ID}.naia-exten-unavailable { opacity: .58; }
-      #${ROW_ID} .naia-exten-character-resync {
-        min-height: 27px; padding: 4px 8px; border: 1px solid var(--border-dim);
-        border-radius: 7px; background: var(--bg-elevated); color: var(--text-secondary);
-        cursor: pointer; font-size: 10px; font-weight: 650; white-space: nowrap;
-      }
-      #${ROW_ID} .naia-exten-character-resync:hover:not(:disabled) { border-color: var(--accent); color: var(--text-primary); }
-      #${ROW_ID} .naia-exten-character-resync:disabled { cursor: default; opacity: .55; }
-    `;
-    document.head.appendChild(style);
-  }
-
-  function syncRowState() {
-    const row = document.getElementById(ROW_ID);
-    if (!row) return;
-    const input = row.querySelector('input[type="checkbox"]');
-    if (!input) return;
-    const resync = row.querySelector('[data-character-resync]');
-
-    const ext = extensionState();
-    const available = Boolean(ext && ext.status === 'loaded' && ext.enabled !== false);
-    const enabled = available && enabledValue();
-    input.disabled = !available;
-    input.checked = enabled;
-    if (resync) resync.disabled = !enabled;
-    // The feature switch disables behavior, but its control must remain
-    // visible so the feature can be enabled again from this module.
-    row.style.display = available ? '' : 'none';
-    row.classList.toggle('naia-exten-unavailable', !available);
-    if (!available) requestExtensionState();
-  }
-
-  function ensureRow() {
-    if (typeof currentModuleId === 'undefined' || currentModuleId !== 'character') return;
-    if (typeof moduleBody === 'undefined' || !moduleBody) return;
-
-    const workspace = moduleBody.querySelector('.mod-character-workspace');
-    const actions = workspace?.querySelector('.mod-char-actions');
-    if (!workspace || !actions) return;
-
-    installStyle();
-    let row = document.getElementById(ROW_ID);
-    if (!row) {
-      row = document.createElement('div');
-      row.id = ROW_ID;
-
-      const labelWrap = document.createElement('div');
-      labelWrap.className = 'naia-exten-character-label-wrap';
-
-      const label = document.createElement('span');
-      label.className = 'naia-exten-character-label';
-      label.textContent = '같은 와일드카드 값 공유';
-
-      const help = document.createElement('span');
-      help.className = 'naia-exten-character-help';
-      help.textContent = '같은 그림의 Character 태그에서 동일 __name__/__*name__ 결과를 재사용';
-
-      const switchLabel = document.createElement('label');
-      switchLabel.className = 'naia-exten-character-switch';
-      switchLabel.title = '예: 두 캐릭터에 __*aa__를 쓰면 한 그림에서는 같은 aa 값이 적용됩니다.';
-
-      const input = document.createElement('input');
-      input.type = 'checkbox';
-      input.setAttribute('aria-label', '같은 와일드카드 값 공유');
-      input.addEventListener('change', () => {
-        setEnabled(input.checked);
-        syncRowState();
-      });
-
-      const track = document.createElement('span');
-      track.className = 'naia-exten-character-track';
-
-      const controls = document.createElement('div');
-      controls.className = 'naia-exten-character-controls';
-
-      const resync = document.createElement('button');
-      resync.type = 'button';
-      resync.className = 'naia-exten-character-resync';
-      resync.dataset.characterResync = '1';
-      resync.textContent = '다시 동기화';
-      resync.title = '현재 활성 캐릭터 프롬프트를 새로 전개하고 같은 와일드카드 값을 다시 공유합니다.';
-      resync.addEventListener('click', () => {
-        if (!enabledValue()) {
-          if (typeof showToast === 'function') showToast('먼저 같은 와일드카드 값 공유를 켜세요.', 'info');
-          return;
-        }
-        resync.disabled = true;
-        resync.textContent = '동기화 중…';
-        try {
-          setModuleParam('extensions', `setting:${EXT_ID}:feature__character_same_wildcard__resync_now`, true);
-          if (typeof showToast === 'function') showToast('캐릭터 와일드카드 다시 동기화 중…', 'info');
-          setTimeout(() => {
-            try { if (typeof requestModuleState === 'function') requestModuleState('character'); } catch (_) {}
-            resync.textContent = '다시 동기화';
-            syncRowState();
-          }, 350);
-        } catch (_) {
-          resync.textContent = '다시 동기화';
-          syncRowState();
-          if (typeof showToast === 'function') showToast('캐릭터 와일드카드 동기화 요청에 실패했습니다.', 'error');
-        }
-      });
-
-      labelWrap.append(label, help);
-      switchLabel.append(input, track);
-      controls.append(resync, switchLabel);
-      row.append(labelWrap, controls);
-      actions.insertAdjacentElement('beforebegin', row);
-    }
-
-    syncRowState();
-  }
-
-  if (typeof moduleBody !== 'undefined' && moduleBody) {
-    new MutationObserver(() => queueMicrotask(ensureRow))
-      .observe(moduleBody, {childList: true});
-  }
-
-  queueMicrotask(ensureRow);
-  setTimeout(ensureRow, 250);
-  setTimeout(ensureRow, 1000);
-})();
-'''
     def __init__(self):
         super().__init__()
         self._context = None
@@ -279,7 +40,6 @@ class CharacterSameWildcardFeature(BaseFeature):
         self._context = app_context
         self._patch_character_scope()
         self._patch_wildcard_resolution()
-        self._patch_character_panel_frontend()
         self.ctx.log("Character same-wildcard feature registered")
 
     def _runtime_active(self) -> bool:
@@ -515,9 +275,8 @@ class CharacterSameWildcardFeature(BaseFeature):
         return str(processor._find_wildcard_key(lookup_name) or lookup_name)
 
     def panel_fields(self) -> list[dict]:
-        # The visible Character-panel button uses the same validated action
-        # route as the generic EXten panel. Keep it hidden there to avoid two
-        # controls for the same operation.
+        # The Character module layout changes between NAIA releases, so keep
+        # this feature's controls in the extension-owned panel only.
         return [
             {
                 "key": self.RESYNC_ACTION,
@@ -527,10 +286,7 @@ class CharacterSameWildcardFeature(BaseFeature):
                     "현재 활성 캐릭터 프롬프트를 새로 전개하고, 같은 와일드카드 토큰에 "
                     "하나의 값을 공유하도록 미리보기와 생성용 상태를 갱신합니다."
                 ),
-                "visible_when": {
-                    "field": "__naia_exten_internal_never__",
-                    "in": ["1"],
-                },
+                "visible_when": {"field": "__enabled__", "in": [True]},
             },
         ]
 
@@ -575,19 +331,3 @@ class CharacterSameWildcardFeature(BaseFeature):
             self.ctx.show_toast(str(message), str(level))
         except Exception:
             pass
-
-
-    # ------------------------------------------------------------------
-    # NAID4 Character module UI (extension-served; NAIA core untouched).
-    # ------------------------------------------------------------------
-
-    def _patch_character_panel_frontend(self) -> None:
-        try:
-            self.ext.patches.add_web_injection(
-                owner=self.id,
-                file_name="app.js",
-                marker=self._PANEL_JS_MARKER,
-                content=self._PANEL_JS,
-            )
-        except Exception as exc:
-            self.ctx.log(f"Character same-wildcard panel UI unavailable: {exc}")

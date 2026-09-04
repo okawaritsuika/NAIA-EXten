@@ -73,6 +73,22 @@ class FeatureReloadTests(unittest.TestCase):
         self.assertIn(NAIAExten.PANEL_LAYOUT_JS_MARKER, runtime_js)
         self.assertIn(NAIAExten.PANEL_LAYOUT_STYLE_ID, runtime_js)
         self.assertIn(NAIAExten.PANEL_LAYOUT_CSS_MARKER, runtime_js)
+        self.assertIn("naia-exten-settings-hidden", css)
+        self.assertIn("settingsCollapsed", runtime_js)
+        self.assertIn("설정 접기", runtime_js)
+        for section in {
+            "Development",
+            "NAID4 Character",
+            "Prompt Engineering",
+            "Search / Parquet",
+            "Tag Filter",
+        }:
+            self.assertIn(f"'{section}'", runtime_js)
+        self.assertNotIn("'Comic Maker',", runtime_js)
+        self.assertIn("applyFieldVisibility(fields)", runtime_js)
+        self.assertIn("popupAnchorRect", runtime_js)
+        self.assertIn("requestAnimationFrame(() => positionPopup(popup))", runtime_js)
+        self.assertIn("aria-expanded", runtime_js)
 
     def test_all_features_register_and_reload_without_patch_conflicts(self):
         with patch.dict(sys.modules, self._host_modules()), tempfile.TemporaryDirectory() as temp_dir:
@@ -128,7 +144,11 @@ class FeatureReloadTests(unittest.TestCase):
             if key.startswith("feature__") and not key.endswith("__enabled"):
                 hidden = field.get("visible_when") or {}
                 if field.get("type") == "action":
-                    if key == "feature__comic_maker__make":
+                    if key in {
+                        "feature__comic_maker__make",
+                        "feature__comic_maker__make_ja",
+                        "feature__comic_maker__make_saved",
+                    }:
                         self.assertNotIn("visible_when", field)
                         continue
                     hidden_field = str(hidden.get("field", ""))
@@ -165,13 +185,12 @@ class FeatureReloadTests(unittest.TestCase):
             {item["owner"] for item in app_js_injections},
             {
                 "parquet_live_sync",
-                "character_same_wildcard",
                 "multi_parquet_pool",
                 "gsqe_probability",
                 "server_random_prompt",
             },
         )
-        self.assertEqual(len(app_js_injections), 5)
+        self.assertEqual(len(app_js_injections), 4)
 
         scripts = {
             item.owner: item.content
@@ -180,14 +199,12 @@ class FeatureReloadTests(unittest.TestCase):
         }
         for owner in {
             "parquet_live_sync",
-            "character_same_wildcard",
             "multi_parquet_pool",
             "gsqe_probability",
             "server_random_prompt",
         }:
             self.assertNotIn("renderExtensions =", scripts[owner], owner)
         self.assertNotIn("subtree: true", scripts["parquet_live_sync"])
-        self.assertNotIn("subtree: true", scripts["character_same_wildcard"])
 
         pop_layers = [
             item

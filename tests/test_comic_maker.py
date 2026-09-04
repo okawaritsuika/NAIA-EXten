@@ -95,6 +95,7 @@ class _FakeClient:
     def __init__(self, plan):
         self.plan = copy.deepcopy(plan)
         self.queries = []
+        self.generate_queries = []
         self.used = []
 
     def presets(self):
@@ -102,6 +103,13 @@ class _FakeClient:
 
     def random_plan(self, **query):
         self.queries.append(query)
+        return copy.deepcopy(self.plan)
+
+    def generate_plan(self, payload, progress=None):
+        self.generate_queries.append(copy.deepcopy(payload))
+        if progress is not None:
+            progress("Story 단계 완료")
+            progress("ComicPlan 단계 완료")
         return copy.deepcopy(self.plan)
 
     def mark_used(self, comic_id):
@@ -131,6 +139,7 @@ class _FakeContext:
         self.logs = []
         self.queue_starts = 0
         self.current_params = {
+            "input": "A quiet tavern scene",
             "pre_prompt": "masterpiece, clean lineart",
             "post_prompt": "high detail",
             "negative_prompt": "bad anatomy",
@@ -194,6 +203,58 @@ class ComicMakerTests(unittest.TestCase):
         make = next(field for field in fields if field["key"] == "make")
         self.assertNotIn("visible_when", make)
         self.assertFalse(feature.panel_toggle_visible)
+        large = next(field for field in fields if field["key"] == "make_ja")
+        self.assertEqual(large["label"], "큰 화면으로 생성")
+        self.assertNotIn("일본어", large["help"])
+        self.assertNotIn("visible_when", large)
+        saved = next(field for field in fields if field["key"] == "make_saved")
+        self.assertEqual(
+            [field["key"] for field in fields],
+            ["make", "make_ja", "make_saved"],
+        )
+        self.assertNotIn("visible_when", saved)
+
+    def test_live_plan_logs_are_bounded_trimmed_and_deduplicated(self):
+        feature = ComicMakerFeature()
+        feature._planning = True
+        feature._refresh_panel = lambda: None
+        for index in range(20):
+            feature._on_plan_progress(f"step {index}")
+        feature._on_plan_progress("step 19")
+        feature._on_plan_progress("x" * 200)
+
+        self.assertEqual(len(feature._planning_logs), 16)
+        self.assertLessEqual(max(map(len, feature._planning_logs)), 180)
+        self.assertEqual(feature._planning_logs[-1], "x" * 180)
+        self.assertEqual(feature._planning_logs.count("step 19"), 1)
+
+    def test_planning_placeholder_shows_streamed_progress(self):
+        feature = ComicMakerFeature()
+        feature._refresh_panel = lambda: None
+        with feature._run_lock:
+            feature._planning = True
+        feature._on_plan_progress("Story 단계 완료")
+        summary = next(field for field in feature.panel_fields() if field["key"] == "summary")
+        self.assertIn("Story 단계 완료", summary["placeholder"])
+
+    def test_completed_run_clears_active_state_and_keeps_recent_summary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = _FakeContext(Path(temp_dir))
+            feature = ComicMakerFeature()
+            feature._attach(SimpleNamespace(ctx=ctx, refresh_panel=lambda: None))
+            feature._client = _FakeClient(comic_plan())
+            feature._prepare(auto_generate=False)
+            feature._start_pending()
+            ctx.results["req-1"] = Image.new("RGB", (832, 1216), "red")
+            feature.on_generation_result({"request_id": "req-1"})
+
+            self.assertIsNone(feature._active_run)
+            fields = feature.panel_fields()
+            self.assertEqual(
+                [field["key"] for field in fields],
+                ["summary", "make", "make_ja", "make_saved"],
+            )
+            self.assertIn("저장 완료", fields[0]["placeholder"])
 
     def test_validates_coordinates_and_references(self):
         plan = validate_comic_plan(comic_plan())
@@ -249,7 +310,7 @@ class ComicMakerTests(unittest.TestCase):
             feature._attach(SimpleNamespace(ctx=ctx, refresh_panel=lambda: None))
             feature._client = _FakeClient(plan)
 
-            feature._prepare()
+            feature._prepare(auto_generate=False)
             feature._start_pending()
 
             overrides = ctx.enqueued[0][1]["overrides"]
@@ -279,7 +340,7 @@ class ComicMakerTests(unittest.TestCase):
             feature._attach(SimpleNamespace(ctx=ctx, refresh_panel=lambda: None))
             feature._client = client
 
-            feature._prepare()
+            feature._prepare(auto_generate=False)
             self.assertEqual(set(client.queries[0]), {"male_count", "female_count", "mark_used"})
             self.assertEqual((client.queries[0]["male_count"], client.queries[0]["female_count"]), (1, 1))
             confirmation = feature.panel_fields()
@@ -293,7 +354,10 @@ class ComicMakerTests(unittest.TestCase):
             feature._start_pending()
             self.assertEqual(len(ctx.enqueued), 1)
             self.assertEqual(ctx.queue_starts, 1)
-            self.assertEqual([field["key"] for field in feature.panel_fields()], ["make"])
+            self.assertEqual(
+                [field["key"] for field in feature.panel_fields()],
+                ["summary", "reset"],
+            )
             self.assertFalse(client.queries[0]["mark_used"])
             first_overrides = ctx.enqueued[0][1]["overrides"]
             self.assertEqual((first_overrides["width"], first_overrides["height"]), (832, 1216))
@@ -322,6 +386,37 @@ class ComicMakerTests(unittest.TestCase):
             with Image.open(pages[0]) as saved:
                 self.assertEqual(saved.size, (832, 1216))
 
+    def test_uses_current_naia_resolution_for_plan_and_generation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = _FakeContext(Path(temp_dir))
+            ctx.current_params.update({
+                "width": 640,
+                "height": 960,
+                "resolution": "832 x 1216",
+            })
+            client = _FakeClient(comic_plan())
+            feature = ComicMakerFeature()
+            feature._attach(SimpleNamespace(ctx=ctx, refresh_panel=lambda: None))
+            feature._client = client
+
+            feature._prepare(auto_generate=True)
+
+            self.assertEqual(
+                (client.generate_queries[0]["width"], client.generate_queries[0]["height"]),
+                (640, 960),
+            )
+            plan = feature._active_run.pending.plan
+            self.assertEqual((plan["width"], plan["height"]), (640, 960))
+            overrides = ctx.enqueued[0][1]["overrides"]
+            self.assertEqual((overrides["width"], overrides["height"]), (640, 960))
+            self.assertEqual(overrides["resolution"], "640 x 960")
+
+    def test_reads_legacy_naia_resolution_string(self):
+        self.assertEqual(
+            ComicMakerFeature._current_resolution({"params": {"resolution": "704 × 1280"}}),
+            (704, 1280),
+        )
+
     def test_confirmation_panel_cancel_returns_to_make_action(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             ctx = _FakeContext(Path(temp_dir))
@@ -330,11 +425,14 @@ class ComicMakerTests(unittest.TestCase):
             feature._attach(SimpleNamespace(ctx=ctx, refresh_panel=lambda: refreshes.append(True)))
             feature._client = _FakeClient(comic_plan())
 
-            feature._prepare()
+            feature._prepare(auto_generate=False)
             feature.handle_action(feature.key("cancel"))
 
             self.assertIsNone(feature._pending)
-            self.assertEqual([field["key"] for field in feature.panel_fields()], ["make"])
+            self.assertEqual(
+                [field["key"] for field in feature.panel_fields()],
+                ["make", "make_ja", "make_saved"],
+            )
             self.assertEqual(ctx.enqueued, [])
             self.assertEqual(ctx.queue_starts, 0)
             self.assertEqual(len(refreshes), 2)
@@ -364,7 +462,7 @@ class ComicMakerTests(unittest.TestCase):
                 completed.set()
 
             feature._resume_generation_queue = resume
-            feature._prepare()
+            feature._prepare(auto_generate=False)
             feature._start_pending()
 
             self.assertTrue(completed.wait(1))
@@ -384,13 +482,86 @@ class ComicMakerTests(unittest.TestCase):
             feature._attach(SimpleNamespace(ctx=ctx, refresh_panel=lambda: None))
             feature._client = _FakeClient(multi)
 
-            feature._prepare()
+            feature._prepare(auto_generate=False)
             feature._start_pending()
 
             self.assertEqual(len(ctx.enqueued), 2)
             first = ctx.enqueued[0][1]["overrides"]["characters"]
             second = ctx.enqueued[1][1]["overrides"]["characters"]
             self.assertEqual(first, second)
+
+    def test_single_panel_mode_splits_panels_and_rebases_spatial_centers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = _FakeContext(Path(temp_dir))
+            ctx.current_params["pre_prompt"] = (
+                "1boy, 1girl, 2girls, 6+boys, other, 3others, masterpiece, clean lineart"
+            )
+            plan = comic_plan()
+            plan["pages"][0]["spatial_prompts"] = [
+                {
+                    "character_id": "male1",
+                    "panel_id": "p1",
+                    "prompt": "sitting at table",
+                    "centers": [{"x": 0.2, "y": 0.2}],
+                },
+                {
+                    "character_id": "female1",
+                    "panel_id": "p2",
+                    "prompt": "looking at door",
+                    "centers": [{"x": 0.8, "y": 0.9}],
+                },
+            ]
+            plan["pages"][0]["bubbles"][0]["speaker"] = "male1"
+            plan["pages"][0]["page_prompt"] = "comic, 2koma, multiple views"
+            client = _FakeClient(plan)
+            original = copy.deepcopy(client.plan)
+            feature = ComicMakerFeature()
+            feature._attach(SimpleNamespace(ctx=ctx, refresh_panel=lambda: None))
+            feature._client = client
+
+            feature._prepare(single_panel_mode=True)
+
+            self.assertEqual(client.generate_queries[0]["locale"], "ko")
+            self.assertEqual(client.plan, original)
+            self.assertEqual(len(ctx.enqueued), 2)
+            self.assertEqual(ctx.queue_starts, 1)
+            self.assertEqual(
+                [request[1]["overrides"]["character_positions"] for request in ctx.enqueued],
+                [
+                    [{"x": 0.2, "y": 0.4}],
+                    [{"x": 0.8, "y": 0.8}, {"x": 0.8, "y": 0.3999999999999999}],
+                ],
+            )
+            self.assertIn("the characters sit together", ctx.enqueued[0][1]["prompt"])
+            self.assertIn("the woman looks surprised", ctx.enqueued[1][1]["prompt"])
+            self.assertTrue(ctx.enqueued[0][1]["prompt"].startswith("1boy, masterpiece"))
+            self.assertTrue(ctx.enqueued[1][1]["prompt"].startswith("1girl, masterpiece"))
+            for request_id, request in ctx.enqueued:
+                self.assertNotIn("2girls", request["prompt"])
+                self.assertNotIn("6+boys", request["prompt"])
+                self.assertNotIn("3others", request["prompt"])
+                self.assertNotIn(", other,", request["prompt"])
+                self.assertIn("single full-canvas", request["prompt"])
+                self.assertNotIn("2koma", request["prompt"])
+                self.assertNotIn("multiple views", request["prompt"])
+                self.assertNotIn("multiple panels", request["prompt"])
+            self.assertTrue(
+                all(
+                    (request[1]["overrides"]["width"], request[1]["overrides"]["height"])
+                    == (832, 1216)
+                    for request in ctx.enqueued
+                )
+            )
+            execution = feature._active_run.pending.plan
+            self.assertEqual(execution["page_count"], 2)
+            self.assertEqual([page["page_number"] for page in execution["pages"]], [1, 2])
+            self.assertEqual(
+                [page["panels"][0]["id"] for page in execution["pages"]], ["p1", "p2"]
+            )
+            self.assertEqual(
+                [page["panels"][0]["rect"] for page in execution["pages"]],
+                [{"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}] * 2,
+            )
 
     def test_failed_panel_does_not_mark_plan_used(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -399,7 +570,7 @@ class ComicMakerTests(unittest.TestCase):
             feature = ComicMakerFeature()
             feature._attach(SimpleNamespace(ctx=ctx, refresh_panel=lambda: None))
             feature._client = client
-            feature._prepare()
+            feature._prepare(auto_generate=False)
             feature._start_pending()
 
             feature.on_generation_result({"request_id": "req-1"})

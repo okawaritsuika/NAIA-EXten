@@ -14,10 +14,10 @@ class NAIAExten:
 
     PANEL_TITLE = "NAIA 추가 편의기능"
 
-    PANEL_LAYOUT_CSS_MARKER = "/* NAIA_EXTEN_PANEL_TOGGLE_LAYOUT_V2 */"
-    PANEL_LAYOUT_JS_MARKER = "/* NAIA_EXTEN_PANEL_TOGGLE_LAYOUT_RUNTIME_V2 */"
-    PANEL_LAYOUT_STYLE_ID = "naiaExtenPanelToggleLayoutV2"
-    PANEL_LAYOUT_CSS = r'''/* NAIA_EXTEN_PANEL_TOGGLE_LAYOUT_V2 */
+    PANEL_LAYOUT_CSS_MARKER = "/* NAIA_EXTEN_PANEL_TOGGLE_LAYOUT_V3 */"
+    PANEL_LAYOUT_JS_MARKER = "/* NAIA_EXTEN_PANEL_TOGGLE_LAYOUT_RUNTIME_V3 */"
+    PANEL_LAYOUT_STYLE_ID = "naiaExtenPanelToggleLayoutV3"
+    PANEL_LAYOUT_CSS = r'''/* NAIA_EXTEN_PANEL_TOGGLE_LAYOUT_V3 */
 /* Keep EXten's four visible feature toggles on one clean label/switch row.
    Select by extension + field key so NAIA's own extension UI is untouched. */
 .ext-quick-popup .ext-field:has(> #extquick-naia_exten-feature__character_same_wildcard__enabled),
@@ -47,6 +47,27 @@ class NAIAExten:
   justify-self: end !important;
   margin: 0 !important;
 }
+.ext-quick-popup .naia-exten-settings-toggle {
+  width: 100%;
+  min-height: 28px;
+  margin: 0 0 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--border-dim);
+  border-radius: 7px;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+  text-align: left;
+}
+.ext-quick-popup .naia-exten-settings-toggle:hover {
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+.ext-quick-popup .naia-exten-settings-hidden {
+  display: none !important;
+}
 '''
 
     @classmethod
@@ -54,6 +75,9 @@ class NAIAExten:
         css = json.dumps(cls.PANEL_LAYOUT_CSS, ensure_ascii=False)
         return f'''{cls.PANEL_LAYOUT_JS_MARKER}
 (() => {{
+  if (window.__naiaExtenPanelToggleLayoutV3) return;
+  window.__naiaExtenPanelToggleLayoutV3 = true;
+
   const styleId = {json.dumps(cls.PANEL_LAYOUT_STYLE_ID)};
   let style = document.getElementById(styleId);
   if (!style) {{
@@ -62,6 +86,100 @@ class NAIAExten:
     document.head.appendChild(style);
   }}
   style.textContent = {css};
+
+  const COLLAPSIBLE_SECTIONS = new Set([
+    'Development',
+    'NAID4 Character',
+    'Prompt Engineering',
+    'Search / Parquet',
+    'Tag Filter',
+  ]);
+  let settingsCollapsed = false;
+  let popupAnchorRect = null;
+
+  function applyFieldVisibility(fields) {{
+    const columns = fields.classList.contains('ext-fields-two-col')
+      ? [...fields.children].filter(child => child.classList.contains('ext-fields-col'))
+      : [fields];
+    columns.forEach(column => {{
+      let hideSection = false;
+      for (const child of column.children) {{
+        if (child.classList.contains('ext-section')) {{
+          const section = String(child.textContent || '').trim();
+          hideSection = COLLAPSIBLE_SECTIONS.has(section);
+        }}
+        child.classList.toggle(
+          'naia-exten-settings-hidden',
+          settingsCollapsed && hideSection
+        );
+      }}
+    }});
+  }}
+
+  function positionPopup(popup) {{
+    if (!popupAnchorRect || popup.style.display === 'none') return;
+    const rect = popupAnchorRect;
+    const width = popup.offsetWidth;
+    const height = popup.offsetHeight;
+    let left = rect.left;
+    let top = rect.bottom + 8;
+    if (top + height > window.innerHeight - 8) {{
+      top = Math.max(8, rect.top - height - 8);
+    }}
+    if (left + width > window.innerWidth - 8) {{
+      left = Math.max(8, window.innerWidth - 8 - width);
+    }}
+    popup.style.left = `${{left}}px`;
+    popup.style.top = `${{top}}px`;
+  }}
+
+  function applySettingsState(popup) {{
+    const body = popup.querySelector('.ext-quick-body');
+    const fields = body?.querySelector('.ext-fields');
+    if (!body || !fields) return;
+
+    let toggle = body.querySelector('.naia-exten-settings-toggle');
+    if (!toggle) {{
+      toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'naia-exten-settings-toggle';
+      toggle.addEventListener('click', () => {{
+        settingsCollapsed = !settingsCollapsed;
+        applySettingsState(popup);
+        requestAnimationFrame(() => positionPopup(popup));
+      }});
+      fields.insertAdjacentElement('beforebegin', toggle);
+    }}
+
+    const label = settingsCollapsed ? '▸ 설정 펼치기' : '▾ 설정 접기';
+    if (toggle.textContent !== label) toggle.textContent = label;
+    toggle.setAttribute('aria-expanded', String(!settingsCollapsed));
+    applyFieldVisibility(fields);
+    body.querySelectorAll('.ext-fields-note').forEach(note =>
+      note.classList.toggle('naia-exten-settings-hidden', settingsCollapsed));
+  }}
+
+  function watchPopup() {{
+    const popup = document.getElementById('extQuickPopup');
+    if (!popup || popup.dataset.naiaExtenSettingsToggle === '1') return;
+    popup.dataset.naiaExtenSettingsToggle = '1';
+    new MutationObserver(() => queueMicrotask(() => {{
+      applySettingsState(popup);
+      requestAnimationFrame(() => positionPopup(popup));
+    }}))
+      .observe(popup, {{childList: true, subtree: true}});
+    applySettingsState(popup);
+  }}
+
+  document.addEventListener('click', event => {{
+    const anchor = event.target.closest(
+      '.ext-tool-btn[data-ext="naia_exten"], .ext-launcher-item[data-ext="naia_exten"]'
+    );
+    if (anchor) popupAnchorRect = anchor.getBoundingClientRect();
+  }}, true);
+
+  watchPopup();
+  new MutationObserver(watchPopup).observe(document.body, {{childList: true}});
 }})();
 '''
 
