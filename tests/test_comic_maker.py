@@ -204,13 +204,12 @@ class ComicMakerTests(unittest.TestCase):
         self.assertNotIn("visible_when", make)
         self.assertFalse(feature.panel_toggle_visible)
         large = next(field for field in fields if field["key"] == "make_ja")
-        self.assertEqual(large["label"], "큰 화면으로 생성")
-        self.assertNotIn("일본어", large["help"])
-        self.assertNotIn("visible_when", large)
+        self.assertIn("visible_when", large)
+        self.assertIn("visible_when", next(field for field in fields if field["key"] == "make_nai"))
         saved = next(field for field in fields if field["key"] == "make_saved")
         self.assertEqual(
-            [field["key"] for field in fields],
-            ["make", "make_ja", "make_saved"],
+            [field["key"] for field in fields if not field.get("visible_when")],
+            ["make", "make_saved"],
         )
         self.assertNotIn("visible_when", saved)
 
@@ -251,8 +250,8 @@ class ComicMakerTests(unittest.TestCase):
             self.assertIsNone(feature._active_run)
             fields = feature.panel_fields()
             self.assertEqual(
-                [field["key"] for field in fields],
-                ["summary", "make", "make_ja", "make_saved"],
+                [field["key"] for field in fields if not field.get("visible_when")],
+                ["summary", "make", "make_saved"],
             )
             self.assertIn("저장 완료", fields[0]["placeholder"])
 
@@ -345,7 +344,7 @@ class ComicMakerTests(unittest.TestCase):
             self.assertEqual((client.queries[0]["male_count"], client.queries[0]["female_count"]), (1, 1))
             confirmation = feature.panel_fields()
             self.assertEqual(
-                [field["key"] for field in confirmation], ["summary", "confirm", "cancel"]
+                [field["key"] for field in confirmation if not field.get("visible_when")], ["summary", "confirm", "cancel", "make", "make_saved"]
             )
             self.assertEqual(confirmation[0]["section"], "Comic Maker")
             self.assertIn("1페이지", confirmation[0]["placeholder"])
@@ -355,8 +354,8 @@ class ComicMakerTests(unittest.TestCase):
             self.assertEqual(len(ctx.enqueued), 1)
             self.assertEqual(ctx.queue_starts, 1)
             self.assertEqual(
-                [field["key"] for field in feature.panel_fields()],
-                ["summary", "reset"],
+                [field["key"] for field in feature.panel_fields() if not field.get("visible_when")],
+                ["summary", "reset", "make", "make_saved"],
             )
             self.assertFalse(client.queries[0]["mark_used"])
             first_overrides = ctx.enqueued[0][1]["overrides"]
@@ -430,8 +429,8 @@ class ComicMakerTests(unittest.TestCase):
 
             self.assertIsNone(feature._pending)
             self.assertEqual(
-                [field["key"] for field in feature.panel_fields()],
-                ["make", "make_ja", "make_saved"],
+                [field["key"] for field in feature.panel_fields() if not field.get("visible_when")],
+                ["make", "make_saved"],
             )
             self.assertEqual(ctx.enqueued, [])
             self.assertEqual(ctx.queue_starts, 0)

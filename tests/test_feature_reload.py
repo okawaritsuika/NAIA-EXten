@@ -24,6 +24,7 @@ from naia_exten.extension import NAIAExten
 
 class _Context:
     def __init__(self, parquet_dir: Path):
+        self.ext_dir = parquet_dir
         self._settings = {}
         self._app_context = SimpleNamespace(
             custom_parquet_dir=lambda: parquet_dir,
@@ -146,7 +147,6 @@ class FeatureReloadTests(unittest.TestCase):
                 if field.get("type") == "action":
                     if key in {
                         "feature__comic_maker__make",
-                        "feature__comic_maker__make_ja",
                         "feature__comic_maker__make_saved",
                     }:
                         self.assertNotIn("visible_when", field)
@@ -188,9 +188,10 @@ class FeatureReloadTests(unittest.TestCase):
                 "multi_parquet_pool",
                 "gsqe_probability",
                 "server_random_prompt",
+                "comic_maker",
             },
         )
-        self.assertEqual(len(app_js_injections), 4)
+        self.assertEqual(len(app_js_injections), 5)
 
         scripts = {
             item.owner: item.content

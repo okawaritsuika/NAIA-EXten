@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
+import uuid
 import threading
 from pathlib import Path
 from typing import Any
@@ -8,6 +11,7 @@ from typing import Any
 import pandas as pd
 
 from .base_feature import BaseFeature
+from ..parquet_sync_journal import ConsumptionJournal
 
 
 class ParquetLiveSyncFeature(BaseFeature):
@@ -29,7 +33,7 @@ class ParquetLiveSyncFeature(BaseFeature):
     name = "Parquet 실시간 동기화"
     description = (
         "Search에서 불러온 custom parquet을 작업 원본으로 추적하고, "
-        "랜덤 프롬프트에 실제 사용된 행만 parquet에서 자동 삭제합니다. "
+        "사용한 행은 즉시 기록하고 parquet 삭제는 15초 단위로 모아서 반영합니다. "
         "Rating/Tag Filter로 잠시 제외된 행은 삭제하지 않습니다."
     )
     category = "Search / Parquet"
@@ -47,10 +51,15 @@ class ParquetLiveSyncFeature(BaseFeature):
         self._target_paths: list[Path] = []
 
         self._state_lock = threading.RLock()
-        self._pending_ids: set[Any] = set()
-        self._pending_rows: list[dict[str, Any]] = []
-        self._worker_running = False
         self._target_generation = 0
+        self._journal = None
+        self._selection_lock = threading.RLock()
+        self._selection_local = threading.local()
+        self._stop = threading.Event()
+        self._worker = None
+        self._compaction_lock = threading.Lock()
+        self._consumed_records = {}
+        self.flush_interval = 15.0
 
         # Prevent nested pop wrappers from scheduling the same consumed id twice.
         self._seen_row_keys: set[str] = set()
@@ -91,10 +100,19 @@ class ParquetLiveSyncFeature(BaseFeature):
             return
 
         self._context = app_context
+        self._journal = ConsumptionJournal(Path(self.ctx.ext_dir) / "parquet_consumption.sqlite3")
+        # Share this lock across feature hot reloads, including an old worker
+        # finishing a large file while the new feature has already registered.
+        lock = getattr(app_context, "_naia_exten_compaction_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            app_context._naia_exten_compaction_lock = lock
+        self._compaction_lock = lock
         self._restore_target_from_settings()
         self._patch_search_backend()
         self._patch_search_result_consumption()
         self._patch_search_panel_frontend()
+        self._start_worker()
 
         self.ctx.log("Parquet 실시간 동기화 feature registered")
 
@@ -238,7 +256,14 @@ class ParquetLiveSyncFeature(BaseFeature):
                 owner=self.id,
                 target=SearchResultModel,
                 method_name=method_name,
-                after=self._after_row_pop,
+                replace=self.run_selection,
+            )
+        # Rating percentages consult counts before selecting a row. Apply old
+        # consumption once to a restored model so those counts remain accurate.
+        if callable(getattr(SearchResultModel, "get_count_by_rating", None)):
+            self.ext.patches.wrap_method(
+                owner=self.id, target=SearchResultModel,
+                method_name="get_count_by_rating", before=self._prepare_model,
             )
 
     # ------------------------------------------------------------------
@@ -348,13 +373,12 @@ class ParquetLiveSyncFeature(BaseFeature):
             seen.add(key)
             unique.append(path)
 
-        with self._state_lock:
+        with self._selection_lock, self._state_lock:
             self._target_generation += 1
             self._target_paths = unique
             self._target_path = unique[0] if unique else None
-            self._pending_ids.clear()
-            self._pending_rows.clear()
-            self._seen_row_keys.clear()
+            self._consumed_records = self._journal.records_for(unique) if self._journal else {}
+            self._seen_row_keys = set(self._consumed_records)
 
         if persist:
             self._save_hidden_setting(self.TARGETS_KEY, [path.name for path in unique])
@@ -373,13 +397,12 @@ class ParquetLiveSyncFeature(BaseFeature):
         self._set_targets(paths)
 
     def _clear_target(self, reason: str = "") -> None:
-        with self._state_lock:
+        with self._selection_lock, self._state_lock:
             had_target = bool(self._target_paths or self._target_path)
             self._target_generation += 1
             self._target_paths = []
             self._target_path = None
-            self._pending_ids.clear()
-            self._pending_rows.clear()
+            self._consumed_records.clear()
             self._seen_row_keys.clear()
 
         self._save_hidden_setting(self.TARGETS_KEY, [])
@@ -391,51 +414,124 @@ class ParquetLiveSyncFeature(BaseFeature):
     # Consume hook
     # ------------------------------------------------------------------
 
-    def _after_row_pop(self, popped_row, model, *args, **kwargs):
+    def run_selection(self, original, model, *args, **kwargs):
+        if (model is not getattr(self._context, "search_results", None)
+                or getattr(self._selection_local, "depth", 0)):
+            return original(model, *args, **kwargs)
+        with self._selection_lock:
+            self._prepare_model(model)
+            self._selection_local.depth = 1
+            try:
+                # Nested host/multi-pool selectors are covered by the outermost
+                # call: record a returned row exactly once, never an intermediate.
+                while True:
+                    row = original(model, *args, **kwargs)
+                    if row is None:
+                        return None
+                    key, _, _ = self._row_identity(row)
+                    if key and key in self._seen_row_keys:
+                        continue
+                    return self._after_row_pop(row, model)
+            finally:
+                self._selection_local.depth = 0
+
+    def _prepare_model(self, model, *args, **kwargs):
         if model is not getattr(self._context, "search_results", None):
-            return popped_row
-        if popped_row is None or not self._runtime_active():
-            return popped_row
+            return
+        with self._selection_lock:
+            if not self._consumed_records:
+                return
+            model._ensure_bucketized()
+            buckets = getattr(model, "_buckets", {})
+            stamp = (id(self), self._target_generation,
+                     tuple((key, id(b.df)) for key, b in buckets.items()))
+            if getattr(model, "_naia_sync_stamp", None) == stamp:
+                return
+            ids = {item[0] for item in self._consumed_records.values() if item[0] is not None}
+            fallback = {}
+            for item in self._consumed_records.values():
+                if item[1] is not None:
+                    data = {key: value for key, value in item[1].items() if key != "__naia_remaining__"}
+                    key = json.dumps(data, sort_keys=True, default=str)
+                    remaining = int(item[1].get("__naia_remaining__", 0))
+                    rec = fallback.setdefault(key, [data, remaining])
+                    rec[1] = min(rec[1], remaining)
+            fallback_indices = {key: set() for key in buckets}
+            for data, remaining in fallback.values():
+                matches = []
+                for key, bucket in buckets.items():
+                    indices = bucket.df.index[self._fallback_mask(bucket.df, data)]
+                    matches.extend((key, index) for index in indices if index not in bucket.consumed_indices)
+                # A compacted file already has <= remaining occurrences. A stale
+                # snapshot has more. This avoids deleting a second identical
+                # no-ID row merely because the file was loaded after compaction.
+                for key, index in matches[:max(0, len(matches) - remaining)]:
+                    fallback_indices[key].add(index)
+            changed = False
+            for key, bucket in buckets.items():
+                frame = bucket.df
+                mask = frame["id"].isin(ids) if ids and "id" in frame else pd.Series(False, index=frame.index)
+                if fallback_indices[key]:
+                    mask.loc[list(fallback_indices[key])] = True
+                removed = set(frame.index[mask]) - bucket.consumed_indices
+                if removed:
+                    bucket.consumed_indices.update(removed)
+                    bucket.invalidate_caches()
+                    changed = True
+            if changed:
+                model._mark_bucket_data_changed()
+                # Equal-source locators may have been built before restoration.
+                model._naia_exten_mp_equal_cache = None
+            model._naia_sync_stamp = stamp
 
+    def _after_row_pop(self, popped_row, model, *args, **kwargs):
+        if (model is not getattr(self._context, "search_results", None)
+                or popped_row is None or not self._runtime_active()):
+            return popped_row
         with self._state_lock:
-            targets = [path for path in self._target_paths if path.is_file()]
-
+            targets = list(self._target_paths)
         if not targets:
             return popped_row
-
-        row_key, row_id, row_fallback = self._row_identity(popped_row)
-        if not row_key:
+        row_key, row_id, fallback = self._row_identity(popped_row)
+        if not row_key or row_key in self._seen_row_keys:
             return popped_row
-
-        with self._state_lock:
-            if row_key in self._seen_row_keys:
-                return popped_row
-            self._seen_row_keys.add(row_key)
-
-        self._remove_from_host_snapshots(row_id, row_fallback)
-
-        with self._state_lock:
-            if row_id is not None:
-                self._pending_ids.add(row_id)
-            elif row_fallback is not None:
-                self._pending_rows.append(row_fallback)
-            generation = self._target_generation
-
-            if not self._worker_running:
-                self._worker_running = True
-                threading.Thread(
-                    target=self._sync_worker,
-                    args=(generation,),
-                    name="naia-exten-parquet-sync",
-                    daemon=True,
-                ).start()
-
+        if row_id is None:
+            # Identical no-ID rows are separate occurrences. Nested calls are
+            # already deduplicated by run_selection, so give each pop its own ID.
+            row_key += ":" + uuid.uuid4().hex
+            matching_limits = []
+            for _, previous in self._consumed_records.values():
+                if previous is not None and {k: v for k, v in previous.items() if k != "__naia_remaining__"} == fallback:
+                    matching_limits.append(int(previous.get("__naia_remaining__", 0)))
+            if matching_limits:
+                remaining = max(0, min(matching_limits) - 1)
+            else:
+                frame = getattr(self._context, "search_results_master_base_snapshot", None)
+                if frame is not None:
+                    remaining = max(0, int(self._fallback_mask(frame, fallback).sum()) - 1)
+                else:
+                    remaining = sum(int(self._fallback_mask(b.df, fallback).sum())
+                                    for b in getattr(model, "_buckets", {}).values()) - 1
+            fallback["__naia_remaining__"] = max(0, remaining)
+        # Small durable transaction only. No DataFrame copy, Parquet read/write,
+        # or snapshot reconstruction takes place on the Random hot path.
+        self._journal.record(targets, row_key, row_id, fallback)
+        self._seen_row_keys.add(row_key)
+        self._consumed_records[row_key] = (row_id, fallback)
+        # This model already consumed the row. Stamp it without rescanning all
+        # prior tombstones on the next pop; new/restored models are filtered once.
+        buckets = getattr(model, "_buckets", {})
+        model._naia_sync_stamp = (id(self), self._target_generation,
+                                 tuple((key, id(b.df)) for key, b in buckets.items()))
+        self._start_worker()
         return popped_row
 
     def _row_identity(self, row):
         try:
             if "id" in row.index and pd.notna(row.get("id")):
                 row_id = row.get("id")
+                if callable(getattr(row_id, "item", None)):
+                    row_id = row_id.item()
                 return f"id:{row_id!r}", row_id, None
         except Exception:
             pass
@@ -453,7 +549,10 @@ class ParquetLiveSyncFeature(BaseFeature):
             "meta",
             "rating",
         )
-        fallback = {key: data.get(key) for key in keys if key in data}
+        fallback = {key: (None if pd.isna(data.get(key)) else data.get(key))
+                    for key in keys if key in data}
+        if "id" in data:
+            fallback["id"] = None
         if not fallback:
             return "", None, None
         key_text = repr(sorted((key, repr(value)) for key, value in fallback.items()))
@@ -463,143 +562,123 @@ class ParquetLiveSyncFeature(BaseFeature):
     # Snapshot + parquet update
     # ------------------------------------------------------------------
 
-    def _remove_from_host_snapshots(
-        self,
-        row_id: Any | None,
-        row_fallback: dict[str, Any] | None,
-    ) -> None:
-        context = self._context
-        if context is None:
-            return
+    def _start_worker(self):
+        with self._state_lock:
+            if self._stop.is_set() or (self._worker and self._worker.is_alive()):
+                return
+            self._worker = threading.Thread(target=self._sync_worker,
+                                            name="naia-exten-parquet-sync", daemon=True)
+            self._worker.start()
 
-        for attr in (
-            "search_results_snapshot",
-            "search_results_master_base_snapshot",
-        ):
-            frame = getattr(context, attr, None)
-            if frame is None or getattr(frame, "empty", True):
-                continue
+    def _sync_worker(self):
+        # A fixed window batches rapid clicks; failures wait for the next window
+        # instead of the old worker's unbounded immediate thread-restart loop.
+        while not self._stop.wait(self.flush_interval):
             try:
-                updated = self._remove_rows_from_frame(
-                    frame,
-                    {row_id} if row_id is not None else set(),
-                    [row_fallback] if row_fallback is not None else [],
-                )
-                if updated is not frame:
-                    setattr(context, attr, updated)
+                self.flush_pending()
             except Exception as exc:
-                self.ctx.log(
-                    f"Parquet sync: memory snapshot update failed ({attr}): {exc}"
-                )
+                self.ctx.log(f"Parquet sync pending (will retry): {exc}")
 
-    def _sync_worker(self, generation: int) -> None:
-        try:
-            while True:
-                with self._state_lock:
-                    if generation != self._target_generation:
-                        return
+    def unregister(self):
+        self._stop.set()
+        if self._worker and self._worker is not threading.current_thread():
+            self._worker.join(timeout=2)
+        # Unflushed records are already durable and replay on the next register.
 
-                    targets = list(self._target_paths)
-                    pending_ids = set(self._pending_ids)
-                    pending_rows = list(self._pending_rows)
-                    self._pending_ids.clear()
-                    self._pending_rows.clear()
-
-                if not targets:
-                    return
-                if not pending_ids and not pending_rows:
-                    return
-
+    def flush_pending(self):
+        with self._compaction_lock:
+            for target, records in self._journal.pending().items():
+                path = Path(target)
+                if not path.is_file():
+                    continue  # Keep its journal if temporarily unavailable.
                 try:
-                    changed_any = False
-                    for target in targets:
-                        if not target.is_file():
+                    receipt = self._journal.receipt(path)
+                    if receipt:
+                        digest, sequences = receipt
+                        if self._file_digest(path) == digest:
+                            # Crash after file replacement but before DB commit:
+                            # do not delete a second identical no-ID row on retry.
+                            self._journal.acknowledge(sequences)
+                            done = set(sequences)
+                            records = [record for record in records if record[0] not in done]
+                        self._journal.clear_receipt(path)
+                        if not records:
                             continue
-                        frame = pd.read_parquet(target)
-                        before = len(frame)
-                        frame = self._remove_rows_from_frame(
-                            frame,
-                            pending_ids,
-                            pending_rows,
-                        )
-                        after = len(frame)
-
-                        if after != before:
-                            self._atomic_write_parquet(target, frame)
-                            changed_any = True
-                            self.ctx.log(
-                                f"Parquet sync: {target.name} "
-                                f"{before:,} → {after:,} rows"
-                            )
-
-                    if changed_any:
-                        self._sync_last_search_cache(
-                            pending_ids,
-                            pending_rows,
-                        )
+                    ids = {record[1] for record in records if record[1] is not None}
+                    fallback = [record[2] for record in records if record[2] is not None]
+                    before_replace = None
+                    if fallback:
+                        before_replace = lambda tmp: self._journal.stage_replacement(
+                            path, self._file_digest(tmp), [record[0] for record in records])
+                    removed = self._compact_parquet(path, ids, fallback, before_replace=before_replace)
+                    self._journal.acknowledge([record[0] for record in records])
+                    self._journal.clear_receipt(path)
+                    if removed:
+                        self.ctx.log(f"Parquet sync: {path.name}, {removed:,} rows removed (batched)")
                 except Exception as exc:
-                    with self._state_lock:
-                        if generation == self._target_generation:
-                            self._pending_ids.update(pending_ids)
-                            self._pending_rows[0:0] = pending_rows
-                    self.ctx.log(f"Parquet sync write failed: {exc}")
-                    return
+                    self.ctx.log(f"Parquet sync pending for {path.name}: {exc}")
 
-                with self._state_lock:
-                    if generation != self._target_generation:
-                        return
-                    if not self._pending_ids and not self._pending_rows:
-                        return
+    @staticmethod
+    def _fallback_mask(frame, data):
+        mask = pd.Series(True, index=frame.index)
+        usable = False
+        for column, expected in data.items():
+            if column not in frame:
+                continue
+            usable = True
+            series = frame[column]
+            mask &= series.isna() if pd.isna(expected) else series.astype(str) == str(expected)
+        return mask if usable else pd.Series(False, index=frame.index)
+
+    @staticmethod
+    def _file_digest(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _compact_parquet(self, path, ids, fallback, *, before_replace=None):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        before_stat = path.stat()
+        fingerprint = (before_stat.st_size, before_stat.st_mtime_ns)
+        tmp = path.with_name(path.name + ".exten.sync.tmp")
+        removed = 0
+        remaining_fallback = list(fallback)
+        try:
+            # Bound peak memory to a batch, rather than reading a multi-GB file
+            # into pandas beside the already-loaded search pool.
+            with pq.ParquetFile(path) as source:
+                with pq.ParquetWriter(tmp, source.schema_arrow, compression="snappy") as writer:
+                    for batch in source.iter_batches(batch_size=65536):
+                        frame = batch.to_pandas()
+                        keep = ~frame["id"].isin(ids) if ids and "id" in frame else pd.Series(True, index=frame.index)
+                        for data in remaining_fallback[:]:
+                            matches = frame.index[keep & self._fallback_mask(frame, data)]
+                            if len(matches):
+                                keep.loc[matches[0]] = False
+                                remaining_fallback.remove(data)
+                        count = int((~keep).sum())
+                        removed += count
+                        # Filter the Arrow batch itself: preserve original field
+                        # types/schema metadata and avoid pandas round-trip casts.
+                        table = pa.Table.from_batches([batch]).filter(pa.array(keep.to_numpy()))
+                        writer.write_table(table)
+            after_stat = path.stat()
+            if (after_stat.st_size, after_stat.st_mtime_ns) != fingerprint:
+                raise RuntimeError("source changed during compaction; journal retained")
+            if removed:
+                with open(tmp, "r+b") as finished:
+                    os.fsync(finished.fileno())
+                if before_replace is not None:
+                    before_replace(tmp)
+                os.replace(tmp, path)
+            return removed
         finally:
-            restart = False
-            restart_generation = None
-            with self._state_lock:
-                self._worker_running = False
-                if (
-                    self._target_paths
-                    and (self._pending_ids or self._pending_rows)
-                ):
-                    self._worker_running = True
-                    restart = True
-                    restart_generation = self._target_generation
-
-            if restart:
-                threading.Thread(
-                    target=self._sync_worker,
-                    args=(restart_generation,),
-                    name="naia-exten-parquet-sync",
-                    daemon=True,
-                ).start()
-
-    def _sync_last_search_cache(
-        self,
-        pending_ids: set[Any],
-        pending_rows: list[dict[str, Any]],
-    ) -> None:
-        context = self._context
-        if context is None:
-            return
-
-        path_getter = getattr(context, "last_search_parquet_path", None)
-        path = path_getter() if callable(path_getter) else None
-        if path is None:
-            return
-        path = Path(path)
-
-        frame = getattr(context, "search_results_master_base_snapshot", None)
-        if frame is not None and not getattr(frame, "empty", True):
-            self._atomic_write_parquet(path, frame)
-            return
-
-        if not path.is_file():
-            return
-        frame = pd.read_parquet(path)
-        frame = self._remove_rows_from_frame(
-            frame,
-            pending_ids,
-            pending_rows,
-        )
-        self._atomic_write_parquet(path, frame)
+            if tmp.exists():
+                tmp.unlink()
 
     @staticmethod
     def _remove_rows_from_frame(

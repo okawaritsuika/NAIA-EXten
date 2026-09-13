@@ -168,8 +168,8 @@ class MultiParquetPoolFeature(BaseFeature):
                         # marker through concat/filtering so runtime selection can
                         # choose a parquet first without holding duplicate frames.
                         source_code = index - 1
-                        frame = frame.copy()
-                        frame[self.SOURCE_COL] = source_code
+                        import numpy as np
+                        frame[self.SOURCE_COL] = np.full(len(frame), source_code, dtype=np.uint16)
                         source_names[source_code] = name
                         frames.append(frame)
                 finally:
@@ -489,7 +489,13 @@ class MultiParquetPoolFeature(BaseFeature):
             return row
         return None
 
-    def pop_equal_row(
+    def pop_equal_row(self, model, active_ratings=None, **kwargs):
+        sync = self.ext.features.get("parquet_live_sync")
+        if sync is not None and hasattr(sync, "run_selection"):
+            return sync.run_selection(self._pop_equal_row, model, active_ratings, **kwargs)
+        return self._pop_equal_row(model, active_ratings, **kwargs)
+
+    def _pop_equal_row(
         self,
         model,
         active_ratings: Any = None,

@@ -15,6 +15,8 @@ from PIL import Image, ImageOps
 from ..base_feature import BaseFeature
 from .client import ComicPlanNotFound, ComicServerClient, ComicServerError
 from .models import validate_comic_plan
+from .stored_workflow import StoredWorkflow
+from .chooser_ui import CHOOSER_JS, CHOOSER_MARKER
 
 
 @dataclass
@@ -31,6 +33,7 @@ class _PendingComic:
 class _ComicRun:
     pending: _PendingComic
     output_dir: Path
+    source: str = "nai"
     requests: dict[str, int] = field(default_factory=dict)
     page_paths: dict[int, Path] = field(default_factory=dict)
     failures: list[str] = field(default_factory=list)
@@ -39,7 +42,7 @@ class _ComicRun:
     next_page_index: int = 0
 
 
-class ComicMakerFeature(BaseFeature):
+class ComicMakerFeature(StoredWorkflow, BaseFeature):
     id = "comic_maker"
     name = "Comic Maker"
     description = "활성 캐릭터를 고정해 PromptServer 만화를 페이지 순서대로 생성합니다."
@@ -57,7 +60,7 @@ class ComicMakerFeature(BaseFeature):
     SERVER_BASE = "http://127.0.0.1:8765"
     _PANEL_STYLE_MARKER = "/* NAIA_EXTEN_COMIC_MAKER_CONFIRM_V1 */"
     _PANEL_STYLE = _PANEL_STYLE_MARKER + r"""
-.ext-quick-popup .ext-field:has(> textarea[data-field="feature__comic_maker__summary"]) {
+.ext-quick-popup .ext-field:has(> textarea:is([data-field="feature__comic_maker__summary"], [data-field="feature__comic_maker__stored_summary"])) {
   display: block;
   min-height: 0;
   margin: 2px 0 4px;
@@ -66,14 +69,14 @@ class ComicMakerFeature(BaseFeature):
   border-radius: 8px;
   background: var(--bg-elevated);
 }
-.ext-quick-popup .ext-field:has(> textarea[data-field="feature__comic_maker__summary"]) > label {
+.ext-quick-popup .ext-field:has(> textarea:is([data-field="feature__comic_maker__summary"], [data-field="feature__comic_maker__stored_summary"])) > label {
   display: block;
   margin-bottom: 5px;
   color: var(--accent-light);
   font-weight: 750;
   white-space: nowrap;
 }
-.ext-quick-popup textarea[data-field="feature__comic_maker__summary"] {
+.ext-quick-popup textarea:is([data-field="feature__comic_maker__summary"], [data-field="feature__comic_maker__stored_summary"]) {
   display: block;
   width: 100%;
   min-height: 40px;
@@ -86,7 +89,7 @@ class ComicMakerFeature(BaseFeature):
   color: var(--text-primary);
   line-height: 1.55;
 }
-.ext-quick-popup textarea[data-field="feature__comic_maker__summary"]::placeholder {
+.ext-quick-popup textarea:is([data-field="feature__comic_maker__summary"], [data-field="feature__comic_maker__stored_summary"])::placeholder {
   color: var(--text-primary);
   opacity: 1;
 }
@@ -132,9 +135,12 @@ class ComicMakerFeature(BaseFeature):
         self._pending: _PendingComic | None = None
         self._active_run: _ComicRun | None = None
         self._planning = False
+        self._nai_stop = threading.Event()
+        self._nai_worker = None
         self._planning_logs: list[str] = []
         self._recent_logs: list[str] = []
         self._last_log_refresh = 0.0
+        self._init_stored()
 
     def register(self) -> None:
         self.ext.patches.add_web_injection(
@@ -144,16 +150,31 @@ class ComicMakerFeature(BaseFeature):
             content=self._PANEL_STYLE,
         )
         self.ctx.subscribe("generation_result_available", self.on_generation_result)
+        self.ext.patches.add_web_injection(
+            owner=self.id, file_name="app.js", marker=CHOOSER_MARKER, content=CHOOSER_JS,
+        )
 
     def unregister(self) -> None:
+        self._nai_stop.set()
+        self._stop_stored()
         with self._run_lock:
             self._pending = None
             self._active_run = None
+            self._stored_pending = None
+            self._stored_run = None
             self._planning = False
             self._planning_logs.clear()
             self._recent_logs.clear()
 
     def panel_fields(self) -> list[dict]:
+        return self._main_panel_fields() + self._stored_status_fields() + [
+            {"key": "make", "type": "action", "label": "만화 만들기 (NAI)",
+             "help": "일반 만화 또는 패널별 큰 화면 생성을 선택합니다."},
+            {"key": "make_saved", "type": "action", "label": "만화 불러오기 (저장 계획)",
+             "help": "서버에 저장된 ComicPlan을 랜덤으로 불러옵니다."},
+        ] + self._stored_fields()
+
+    def _main_panel_fields(self) -> list[dict]:
         with self._run_lock:
             planning = bool(getattr(self, "_planning", False))
             pending = self._pending
@@ -169,8 +190,8 @@ class ComicMakerFeature(BaseFeature):
                     "label": "Comic Maker",
                     "default": "",
                     "placeholder": (
-                        "NovelAI가 Story / ComicPlan을 만드는 중입니다...\n"
-                        "완료되면 모든 페이지가 NAIA 큐에 자동 등록됩니다."
+                        ("NAI API가 Story / ComicPlan을 만드는 중입니다...\n"
+                         "완료되면 모든 페이지가 NAIA 큐에 자동 등록됩니다.")
                         + ("\n" + "\n".join(planning_logs) if planning_logs else "")
                     ),
                     "multiline": True,
@@ -179,8 +200,8 @@ class ComicMakerFeature(BaseFeature):
                 {
                     "key": "reset",
                     "type": "action",
-                    "label": "작업 상태 초기화",
-                    "help": "응답이 멈췄거나 작업을 버리고 다시 시작할 때 사용합니다.",
+                    "label": "NAI 작업 중지",
+                    "help": "NAI 작업의 대기와 이미지 생성을 중지합니다.",
                     "section": self.category,
                 },
             ]
@@ -200,7 +221,7 @@ class ComicMakerFeature(BaseFeature):
                     "label": "Comic Maker",
                     "default": "",
                     "placeholder": (
-                        f"NAIA 만화 생성 중...\n"
+                        f"NAI 만화 생성 중...\n"
                         f"완료 {completed}/{total} · 추적 중 {queued}"
                         + ("\n" + log_text if log_text else "")
                     ),
@@ -214,7 +235,7 @@ class ComicMakerFeature(BaseFeature):
                 {
                     "key": "reset",
                     "type": "action",
-                    "label": "큐 종료됨 / 작업 상태 초기화",
+                    "label": "NAI 작업 상태 초기화",
                     "help": "남은 Comic Maker request 추적을 취소하고 새 작업을 가능하게 합니다.",
                     "section": self.category,
                 },
@@ -251,20 +272,7 @@ class ComicMakerFeature(BaseFeature):
                 },
             ]
 
-        fields = [
-            {
-                "key": "make",
-                "type": "action",
-                "label": "만화 만들기 · NovelAI 자동",
-                "help": "현재 NAIA 자동생성 프롬프트를 Story → ComicPlan으로 변환해 자동 생성합니다.",
-            },
-            {
-                "key": "make_saved",
-                "type": "action",
-                "label": "저장 ComicPlan 랜덤",
-                "help": "PromptServer에 저장된 기존 ComicPlan을 사용합니다.",
-            },
-        ]
+        fields = []
         if recent_logs:
             fields.insert(0, {
                 "key": "summary",
@@ -282,13 +290,14 @@ class ComicMakerFeature(BaseFeature):
         return str(message or "").replace("\r", " ").replace("\n", " ").strip()[: cls._LOG_LINE_LIMIT]
 
     def _append_log(
-        self, message: Any, *, run: _ComicRun | None = None, force_refresh: bool = False
+        self, message: Any, *, run: _ComicRun | None = None, force_refresh: bool = False,
+        source: str = "nai",
     ) -> None:
         line = self._log_line(message)
         if not line:
             return
         with self._run_lock:
-            target = run.logs if run is not None else self._planning_logs
+            target = run.logs if run is not None else (self._stored_logs if source == "stored" else self._planning_logs)
             if target and target[-1] == line:
                 return
             target.append(line)
@@ -308,53 +317,39 @@ class ComicMakerFeature(BaseFeature):
                 return
         self._append_log(message)
 
-    def _store_recent_logs(self, logs: list[str]) -> None:
+    def _store_recent_logs(self, logs: list[str], *, source: str = "nai") -> None:
         with self._run_lock:
-            self._recent_logs = list(logs[-self._LOG_LIMIT:])
+            if source == "stored":
+                self._stored_recent_logs = list(logs[-self._LOG_LIMIT:])
+            else:
+                self._recent_logs = list(logs[-self._LOG_LIMIT:])
 
 
     def handle_action(self, full_key: str) -> None:
         if full_key == self.key("reset"):
-            self._reset_comic_state(
-                "Comic Maker 작업 상태를 초기화했습니다. 새 만화를 다시 만들 수 있습니다."
-            )
+            self._reset_comic_state("NAI 작업을 중지했습니다.", source="nai")
             return
-
+        if full_key == self.key("reset_stored"):
+            self._reset_comic_state("저장 계획 작업을 중지했습니다.", source="stored")
+            return
         if full_key == self.key("make"):
-            with self._run_lock:
-                busy = (
-                    bool(getattr(self, "_planning", False))
-                    or self._pending is not None
-                    or self._active_run is not None
-                )
-                if not busy:
-                    self._planning = True
-                    self._planning_logs.clear()
-                    self._recent_logs.clear()
-
-            if busy:
-                self._toast(
-                    "기존 Comic Maker 작업이 남아 있습니다. "
-                    "'작업 상태 초기화' 후 다시 시도하세요.",
-                    "warning",
-                )
-                return
-
+            # The browser opens the NAI mode chooser; opening it starts no work.
             self._refresh_panel()
-            self._toast(
-                "NovelAI에서 Story와 ComicPlan을 만드는 중입니다...",
-                "info",
-            )
-            threading.Thread(
-                target=self._prepare,
-                kwargs={"auto_generate": True},
-                daemon=True,
-                name="comic-maker-novelai-plan",
-            ).start()
+            return
+        if full_key in (self.key("make_nai"), self.key("make_ja")):
+            self._start_nai(single_panel_mode=full_key == self.key("make_ja"))
             return
 
         if full_key == self.key("make_saved"):
-            self._prepare(auto_generate=False)
+            self._start_stored()
+            return
+        if full_key == self.key("confirm_stored"):
+            self._start_pending(source="stored")
+            return
+        if full_key == self.key("cancel_stored"):
+            with self._run_lock:
+                self._stored_pending = None
+            self._refresh_panel()
             return
 
         if full_key == self.key("confirm"):
@@ -367,27 +362,58 @@ class ComicMakerFeature(BaseFeature):
             self._refresh_panel()
 
 
-    def _reset_comic_state(self, message: str = "") -> None:
+    def _nai_busy(self) -> bool:
+        return bool(self._planning or self._pending is not None or self._active_run is not None
+                    or (self._nai_worker and self._nai_worker.is_alive()))
+
+    def _start_nai(self, *, single_panel_mode=False) -> None:
         with self._run_lock:
-            run = self._active_run
-            self._active_run = None
-            self._pending = None
-            self._planning = False
+            if self._nai_busy():
+                self._toast("이미 NAI 작업이 진행 중입니다.", "warning")
+                return
+            self._planning = True
             self._planning_logs.clear()
             self._recent_logs.clear()
+            self._nai_stop = threading.Event()
+            self._nai_worker = threading.Thread(
+                target=self._prepare,
+                kwargs={"auto_generate": True, "single_panel_mode": single_panel_mode,
+                        "stop": self._nai_stop},
+                daemon=True, name="comic-maker-novelai-plan",
+            )
+            self._nai_worker.start()
+        self._refresh_panel()
 
-        if run is not None:
+    def _reset_comic_state(self, message: str = "", *, source: str | None = None) -> None:
+        runs = []
+        with self._run_lock:
+            if source in (None, "nai"):
+                self._nai_stop.set()
+                if self._active_run is not None:
+                    runs.append(self._active_run)
+                self._active_run = None
+                self._pending = None
+                self._planning = False
+                self._planning_logs.clear()
+                self._recent_logs.clear()
+            if source in (None, "stored"):
+                self._stop_stored()
+                if self._stored_run is not None:
+                    runs.append(self._stored_run)
+                self._stored_run = None
+                self._stored_pending = None
+                self._stored_logs.clear()
+                self._stored_recent_logs.clear()
+        for run in runs:
             for request_id in list(run.requests):
                 try:
                     self.ctx.cancel_generation(request_id)
                 except Exception:
                     pass
             run.requests.clear()
-
         self._refresh_panel()
         if message:
             self._toast(message, "info")
-
 
     def _toast(self, message: str, level: str = "info") -> None:
         try:
@@ -572,19 +598,26 @@ class ComicMakerFeature(BaseFeature):
         execution_plan["height"] = height
         return execution_plan
 
-    def _prepare(self, auto_generate: bool = True, single_panel_mode: bool = False) -> None:
+    def _prepare(self, auto_generate: bool = True, single_panel_mode: bool = False,
+                 *, source: str = "nai", stop=None) -> None:
+        stop = stop or (self._stored_stop if source == "stored" else self._nai_stop)
         with self._run_lock:
-            if self._active_run is not None or self._pending is not None:
+            run = self._stored_run if source == "stored" else self._active_run
+            pending = self._stored_pending if source == "stored" else self._pending
+            if stop.is_set() or run is not None or pending is not None:
                 self._toast("이미 준비 또는 생성 중인 만화가 있습니다.", "warning")
                 return
-            self._planning_logs.clear()
-            self._recent_logs.clear()
+            if source == "nai":
+                self._planning_logs.clear()
+                self._recent_logs.clear()
         current = self.ctx.get_current_request()
         if not current.get("ok") or str(current.get("api_mode") or "").upper() != "NAI":
-            if auto_generate:
-                with self._run_lock:
+            with self._run_lock:
+                if source == "stored":
+                    self._stored_waiting = False
+                else:
                     self._planning = False
-                self._refresh_panel()
+            self._refresh_panel()
             self._toast("Comic Maker는 현재 NAI 모드에서만 사용할 수 있습니다.", "error")
             return
         try:
@@ -628,7 +661,7 @@ class ComicMakerFeature(BaseFeature):
                     "page_count": None,
                     "locale": "ko",
                     "dialogue_mode": "none",
-                }, progress=self._on_plan_progress))
+                }, progress=lambda message: None if stop.is_set() else self._on_plan_progress(message)))
             else:
                 plan = validate_comic_plan(self._client.random_plan(
                     male_count=male_count, female_count=female_count, mark_used=False,
@@ -638,12 +671,16 @@ class ComicMakerFeature(BaseFeature):
             if single_panel_mode:
                 plan = self._make_large_screen_plan(plan, width, height)
         except (ComicPlanNotFound, ComicServerError, ValueError) as exc:
-            if auto_generate:
-                self._append_log(f"오류: {exc}", force_refresh=True)
-                self._store_recent_logs(self._planning_logs)
-                with self._run_lock:
+            with self._run_lock:
+                if stop.is_set():
+                    return
+                if source == "stored":
+                    self._stored_waiting = False
+                else:
                     self._planning = False
-                self._refresh_panel()
+                self._append_log(f"오류: {exc}", source=source)
+                self._store_recent_logs(self._stored_logs if source == "stored" else self._planning_logs, source=source)
+            self._refresh_panel()
             self._toast(str(exc), "error")
             return
         # Normalized page geometry can be rendered at the active NAIA canvas
@@ -652,8 +689,13 @@ class ComicMakerFeature(BaseFeature):
         plan["height"] = height
         pending = _PendingComic(plan, current, prompts, ucs, positions, single_panel_mode)
         with self._run_lock:
-            self._pending = pending
-            if auto_generate:
+            if stop.is_set():
+                return
+            if source == "stored":
+                self._stored_pending = pending
+                self._stored_waiting = False
+            else:
+                self._pending = pending
                 self._planning = False
         if auto_generate:
             self._append_log(
@@ -664,27 +706,28 @@ class ComicMakerFeature(BaseFeature):
                 f"ComicPlan 수신 완료: {plan['page_count']}페이지. NAIA 이미지 생성을 자동 시작합니다.",
                 "success",
             )
-            self._start_pending()
+            self._start_pending(source=source, stop=stop)
         else:
             self._refresh_panel()
 
-    def _start_pending(self) -> None:
+    def _start_pending(self, *, source: str = "nai", stop=None) -> None:
         with self._run_lock:
-            pending = self._pending
-            self._pending = None
-            can_start = pending is not None and self._active_run is None
-
-        if not can_start:
-            self._refresh_panel()
-            return
-
-        run = _ComicRun(
-            pending=pending,
-            output_dir=self._create_output_dir(pending.plan),
-            logs=list(self._planning_logs[-self._LOG_LIMIT:]),
-        )
-        with self._run_lock:
-            self._active_run = run
+            pending = self._stored_pending if source == "stored" else self._pending
+            active = self._stored_run if source == "stored" else self._active_run
+            if pending is None or active is not None or (stop is not None and stop.is_set()):
+                self._refresh_panel()
+                return
+            run = _ComicRun(
+                pending=pending, source=source,
+                output_dir=self._create_output_dir(pending.plan),
+                logs=list((self._stored_logs if source == "stored" else self._planning_logs)[-self._LOG_LIMIT:]),
+            )
+            if source == "stored":
+                self._stored_pending = None
+                self._stored_run = run
+            else:
+                self._pending = None
+                self._active_run = run
 
         self._append_log("NAIA 이미지 생성을 시작합니다.", run=run, force_refresh=True)
 
@@ -714,7 +757,10 @@ class ComicMakerFeature(BaseFeature):
             # event is being handled. Since the full ComicPlan already exists,
             # there is no reason to enqueue page N+1 from page N's result event.
             for index, page in enumerate(pages, start=1):
-                self._enqueue_page(run, page)
+                with self._run_lock:
+                    if run is not (self._stored_run if source == "stored" else self._active_run):
+                        return
+                    self._enqueue_page(run, page)
                 page_number = int(page.get("page_number") or index)
                 message = f"[ComicMaker] queued page {page_number}/{len(pages)}"
                 self.ctx.log(message)
@@ -733,6 +779,9 @@ class ComicMakerFeature(BaseFeature):
             self._append_log(message, run=run)
 
             # Start the host queue exactly once.
+            with self._run_lock:
+                if run is not (self._stored_run if source == "stored" else self._active_run):
+                    return
             self._start_generation_queue(run)
 
         except Exception as exc:
@@ -1001,7 +1050,8 @@ class ComicMakerFeature(BaseFeature):
 
         request_id = str(info.get("request_id") or "")
         with self._run_lock:
-            run = self._active_run
+            run = next((item for item in (self._active_run, self._stored_run)
+                        if item is not None and request_id in item.requests), None)
             page_number = run.requests.pop(request_id, None) if run else None
 
         if run is None or page_number is None:
@@ -1047,21 +1097,20 @@ class ComicMakerFeature(BaseFeature):
         completed = len(run.page_paths) + len(run.failures)
 
         try:
-            with self._run_lock:
-                still_active = self._active_run is run
-                no_outstanding = not run.requests
-
             # All pages were already queued before generation started.
             # Never enqueue from a generation-result event.
 
             with self._run_lock:
                 done = (
-                    self._active_run is run
+                    (self._active_run is run or self._stored_run is run)
                     and run.enqueued_complete
                     and not run.requests
                 )
                 if done:
-                    self._active_run = None
+                    if self._stored_run is run:
+                        self._stored_run = None
+                    else:
+                        self._active_run = None
             self._refresh_panel()
             if done:
                 self._finish_run(run)
@@ -1078,7 +1127,7 @@ class ComicMakerFeature(BaseFeature):
         if run.failures or len(run.page_paths) != plan["page_count"]:
             detail = run.failures[0] if run.failures else "완성되지 않은 페이지가 있습니다."
             self._append_log(f"만화 생성 실패: {detail}", run=run, force_refresh=True)
-            self._store_recent_logs(run.logs)
+            self._store_recent_logs(run.logs, source=run.source)
             self._refresh_panel()
             self._toast(f"만화 생성 실패 — used 처리 안 함: {detail}", "error")
             return
@@ -1086,12 +1135,12 @@ class ComicMakerFeature(BaseFeature):
             self._client.mark_used(plan["id"])
         except ComicServerError as exc:
             self._append_log(f"페이지 생성 완료, used 처리 실패: {exc}", run=run, force_refresh=True)
-            self._store_recent_logs(run.logs)
+            self._store_recent_logs(run.logs, source=run.source)
             self._refresh_panel()
             self._toast(f"페이지 생성 완료, used 처리 실패: {exc}", "warning")
             return
         self._append_log(f"만화 {plan['page_count']}페이지 저장 완료", run=run, force_refresh=True)
-        self._store_recent_logs(run.logs)
+        self._store_recent_logs(run.logs, source=run.source)
         self._refresh_panel()
         self._toast(f"만화 {plan['page_count']}페이지 저장 완료: {run.output_dir}", "success")
 
@@ -1099,9 +1148,11 @@ class ComicMakerFeature(BaseFeature):
         with self._run_lock:
             if self._active_run is run:
                 self._active_run = None
-            self._planning = False
+                self._planning = False
+            if self._stored_run is run:
+                self._stored_run = None
         self._append_log(f"실패: {message}", run=run, force_refresh=True)
-        self._store_recent_logs(run.logs)
+        self._store_recent_logs(run.logs, source=run.source)
         self._refresh_panel()
         for request_id in list(run.requests):
             try:
@@ -1118,106 +1169,3 @@ class ComicMakerFeature(BaseFeature):
         output = root / "comic_maker" / f"{stamp}_{plan['id']}_{safe_title[:60]}"
         output.mkdir(parents=True, exist_ok=False)
         return output
-
-# === LARGE SCREEN BUTTON COMPATIBILITY PATCH ===
-if not getattr(ComicMakerFeature, "_large_screen_button_installed", False):
-    _large_screen_original_panel_fields = ComicMakerFeature.panel_fields
-    _large_screen_original_handle_action = ComicMakerFeature.handle_action
-
-    def _large_screen_panel_fields(self, *args, **kwargs):
-        fields = _large_screen_original_panel_fields(self, *args, **kwargs)
-
-        if not isinstance(fields, list):
-            return fields
-
-        if any(
-            isinstance(item, dict) and item.get("key") == "make_ja"
-            for item in fields
-        ):
-            return fields
-
-        make_index = None
-        for index, item in enumerate(fields):
-            if isinstance(item, dict) and item.get("key") == "make":
-                make_index = index
-                break
-
-        if make_index is not None:
-            fields.insert(make_index + 1, {
-                "key": "make_ja",
-                "type": "action",
-                "label": "큰 화면으로 생성",
-                "help": (
-                    "자동 ComicPlan의 각 패널을 독립된 832 × 1216 전체 이미지로 "
-                    "순서대로 생성합니다."
-                ),
-            })
-
-        return fields
-
-    def _large_screen_handle_action(self, full_key, *args, **kwargs):
-        if full_key == self.key("make_ja"):
-            lock = getattr(self, "_run_lock", None)
-
-            if lock is not None:
-                with lock:
-                    busy = bool(
-                        getattr(self, "_planning", False)
-                        or getattr(self, "_pending", None) is not None
-                        or getattr(self, "_active_run", None) is not None
-                    )
-                    if not busy:
-                        try:
-                            self._planning = True
-                            self._planning_logs.clear()
-                            self._recent_logs.clear()
-                        except Exception:
-                            pass
-            else:
-                busy = bool(
-                    getattr(self, "_planning", False)
-                    or getattr(self, "_pending", None) is not None
-                    or getattr(self, "_active_run", None) is not None
-                )
-                if not busy and hasattr(self, "_planning"):
-                    self._planning = True
-                    if hasattr(self, "_planning_logs"):
-                        self._planning_logs.clear()
-                    if hasattr(self, "_recent_logs"):
-                        self._recent_logs.clear()
-
-            if busy:
-                toast = getattr(self, "_toast", None)
-                if callable(toast):
-                    toast("이미 Comic Maker 작업이 진행 중입니다.", "warning")
-                return
-
-            refresh = getattr(self, "_refresh_panel", None)
-            if callable(refresh):
-                try:
-                    refresh()
-                except Exception:
-                    pass
-
-            toast = getattr(self, "_toast", None)
-            if callable(toast):
-                toast(
-                    "ComicPlan의 각 패널을 큰 화면 이미지로 만드는 중입니다...",
-                    "info",
-                )
-
-            import threading as _large_screen_threading
-
-            _large_screen_threading.Thread(
-                target=self._prepare,
-                kwargs={"auto_generate": True, "single_panel_mode": True},
-                daemon=True,
-                name="comic-maker-large-screen",
-            ).start()
-            return
-
-        return _large_screen_original_handle_action(self, full_key, *args, **kwargs)
-
-    ComicMakerFeature.panel_fields = _large_screen_panel_fields
-    ComicMakerFeature.handle_action = _large_screen_handle_action
-    ComicMakerFeature._large_screen_button_installed = True

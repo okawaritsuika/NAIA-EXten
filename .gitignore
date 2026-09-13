@@ -1,5 +1,9 @@
 # Local NAIA runtime state
 settings.json
+_comic_grok_job.json
+_comic_grok_job.tmp
+/parquet_consumption.sqlite3*
+/_novelai_auto_backup/
 
 # Python-generated files
 __pycache__/

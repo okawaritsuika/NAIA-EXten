@@ -58,7 +58,7 @@ class ComicServerClient:
             with urllib.request.urlopen(request, timeout=request_timeout) as response:
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
-            if exc.code == 404:
+            if exc.code == 404 and path == "/api/comics/random":
                 raise ComicPlanNotFound("조건에 맞는 ComicPlan이 없습니다.") from exc
             detail = ""
             try:
@@ -72,10 +72,6 @@ class ComicServerClient:
             return json.loads(raw) if raw else None
         except json.JSONDecodeError as exc:
             raise ComicServerError("PromptServer가 잘못된 JSON을 반환했습니다.") from exc
-
-    def presets(self) -> list[dict[str, Any]]:
-        payload = self._request("GET", "/api/comic-presets")
-        return payload if isinstance(payload, list) else []
 
     def random_plan(self, **filters: Any) -> dict[str, Any]:
         payload = self._request("GET", "/api/comics/random", query=filters)
