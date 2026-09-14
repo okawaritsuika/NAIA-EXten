@@ -143,6 +143,11 @@ class FeatureReloadTests(unittest.TestCase):
         for field in panel_fields:
             key = str(field.get("key", ""))
             if key.startswith("feature__") and not key.endswith("__enabled"):
+                if key == "feature__generation_progress__mode":
+                    self.assertNotIn("visible_when", field)
+                    self.assertEqual(field["options"], ["부드럽게", "숨기기", "NAIA 기본"])
+                    self.assertEqual(field["default"], "부드럽게")
+                    continue
                 hidden = field.get("visible_when") or {}
                 if field.get("type") == "action":
                     if key in {
@@ -189,9 +194,10 @@ class FeatureReloadTests(unittest.TestCase):
                 "gsqe_probability",
                 "server_random_prompt",
                 "comic_maker",
+                "generation_progress",
             },
         )
-        self.assertEqual(len(app_js_injections), 5)
+        self.assertEqual(len(app_js_injections), 6)
 
         scripts = {
             item.owner: item.content
